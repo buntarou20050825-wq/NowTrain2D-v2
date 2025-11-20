@@ -45,6 +45,7 @@ NowTrain-v2/
 - Node.js (v18 以上推奨)
 - **Python 3.10 以上（3.11 推奨）**
   - MS2 までは 3.9 でも動作しましたが、MS3-1 以降は型ヒント・標準ライブラリの都合により 3.10+ を前提とします
+  - MS3-2 以降は `zoneinfo` を使用します。Windows など一部環境では `tzdata` パッケージのインストールが必要な場合があります（`pip install tzdata`）
 - Mapbox アクセストークン（[こちら](https://account.mapbox.com/access-tokens/)から取得）
 
 ### フロントエンド
@@ -205,18 +206,102 @@ FRONTEND_URL=http://localhost:5173,http://127.0.0.1:5173
 
 ### MS3-1 完了の確認項目
 
-- [ ] `backend/timetable_models.py` が作成され、`StopTime` / `TimetableTrain` が定義されている
-- [ ] `backend/data_cache.py` に時刻表読み込み機能が追加されている
-- [ ] バックエンド起動時に `Loaded X Yamanote timetable trains` のログが表示される
-- [ ] バックエンド起動時に `Yamanote service types: [...]` のログが表示される
-- [ ] 既存の API (`/api/lines` など) が引き続き正常に動作している
+- [x] `backend/timetable_models.py` が作成され、`StopTime` / `TimetableTrain` が定義されている
+- [x] `backend/data_cache.py` に時刻表読み込み機能が追加されている
+- [x] バックエンド起動時に `Loaded X Yamanote timetable trains` のログが表示される
+- [x] バックエンド起動時に `Yamanote service types: [...]` のログが表示される
+- [x] 既存の API (`/api/lines` など) が引き続き正常に動作している
+
+## MS3-2: 時刻表ベースの列車位置計算
+
+### 概要
+
+MS3-2 では、時刻表データと現在時刻から「抽象的な列車の位置」を計算するロジックを実装します。
+- 対象は **山手線のみ** (`JR-East.Yamanote`)
+- **座標（経度緯度）は計算しない** → 「どの列車が」「どの駅の間（もしくはどの駅で停車中）」にいるかまで
+
+### バックエンド構成
+
+バックエンドのレイヤ構成は以下のようになっています：
+
+1. **timetable_models.py** - 時刻表 JSON を Python オブジェクトに変換する静的モデル層
+2. **data_cache.py** - JSON 読み込み・キャッシュを担当するデータアクセス層
+3. **train_state.py** (MS3-2 で追加) - 時刻表 + 時刻 → 列車状態（駅間 or 停車中）を計算するロジック層
+4. API 層 (MS3-3 以降) - `train_state` を呼び出して API レスポンスを作る
+
+### 実装内容
+
+#### backend/train_state.py
+
+以下のデータクラスと関数を実装しています：
+
+**データクラス:**
+- `TrainSegment`: 1本の列車の1区間（走行 or 停車）を表す
+  - 時間範囲は `[start_sec, end_sec)` の半開区間
+- `TrainSectionState`: 列車が今どこにいるか（停車 or 走行）を表す抽象状態
+  - `is_stopped`: 停車中かどうか
+  - `progress`: 走行中の場合の進捗度 (0.0〜1.0)
+
+**時間系ユーティリティ:**
+- `get_service_date()`: サービス日の計算（04:00 を境界とする）
+- `to_effective_seconds()`: サービス日開始からの秒数に変換
+- `determine_service_type()`: 曜日から service_type を判定（月〜金: "Weekday", 土日: "SaturdayHoliday"）
+
+**セグメント構築:**
+- `build_segments_for_train()`: 1本の列車から走行/停車セグメントを構築
+- `build_yamanote_segments()`: 全山手線列車のセグメントを構築
+
+**列車状態計算:**
+- `get_yamanote_trains_at()`: 指定時刻における山手線の運行中列車の状態を返す
+  - 線形走査で該当セグメントを検索
+  - `service_type` が "Weekday" / "SaturdayHoliday" 以外の列車は無視
+
+**デバッグ用:**
+- `debug_dump_trains_at()`: 指定時刻の列車状態をコンソールにダンプ
+
+#### 循環 import 回避
+
+`train_state.py` では `DataCache` を型ヒントとしてのみ参照するため、`TYPE_CHECKING` を使って循環 import を回避しています：
+
+```python
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from data_cache import DataCache
+```
+
+実際の `build_yamanote_segments()` 呼び出しは `data_cache.py` 側から行います。
+
+### 動作確認
+
+テストスクリプト (`test_train_state.py`) で以下を確認できます：
+
+```bash
+cd /path/to/NowTrain2D-v2
+python test_train_state.py
+```
+
+確認ポイント：
+- 山手線セグメント数が 30,000 件以上構築されている
+- 深夜帯で列車が正しく検出される
+- 走行中の列車の進捗度 (0.0〜1.0) が計算される
+- 時間系ユーティリティが正しく動作する
+
+### MS3-2 完了の確認項目
+
+- [x] `backend/train_state.py` が作成されている
+- [x] `backend/data_cache.py` に `yamanote_segments` フィールドが追加されている
+- [x] バックエンド起動時に `Built X Yamanote train segments` のログが表示される
+- [x] `get_yamanote_trains_at()` で指定時刻の列車状態が取得できる
+- [x] 走行中の列車の進捗度が 0.0〜1.0 で計算される
+- [x] 停車中の列車が駅ID とともに正しく検出される
 
 ## 開発ロードマップ
 
 - **MS1**: プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
 - **MS2**: FastAPI で静的データを API 化 ✅
-- **MS3-1** (現在): 山手線の時刻表読み込みと日跨ぎ正規化
-- **MS3-2**: 時刻表ベースの列車位置計算
+- **MS3-1**: 山手線の時刻表読み込みと日跨ぎ正規化 ✅
+- **MS3-2** (現在): 時刻表ベースの列車位置計算 ✅
 - **MS3-3**: 列車位置 API の実装
 - **MS4**: GTFS-RT との統合
 - **MS5**: UI/UX 強化

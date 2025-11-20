@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from timetable_models import StopTime, TimetableTrain
+from train_state import TrainSegment, build_yamanote_segments
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,9 @@ class DataCache:
         # MS3-1: 山手線の時刻表（TimetableTrain の配列）
         self.yamanote_trains: List[TimetableTrain] = []
 
+        # MS3-2: 山手線のセグメント（TrainSegment の配列）
+        self.yamanote_segments: List[TrainSegment] = []
+
         # TODO (MS6): パフォーマンス最適化
         # self.railways_by_id: Dict[str, Dict[str, Any]] = {}
         # self.stations_by_id: Dict[str, Dict[str, Any]] = {}
@@ -323,3 +327,7 @@ class DataCache:
         if self.yamanote_trains:
             service_types = {t.service_type for t in self.yamanote_trains}
             logger.info("Yamanote service types: %s", sorted(service_types))
+
+        # MS3-2: 山手線のセグメントを構築
+        self.yamanote_segments = build_yamanote_segments(self.yamanote_trains)
+        logger.info("Built %d Yamanote train segments", len(self.yamanote_segments))
