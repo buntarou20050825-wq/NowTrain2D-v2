@@ -19,7 +19,7 @@ load_dotenv()
 app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # NowTrain-v2/
-DATA_DIR = BASE_DIR / "data" / "mini-tokyo-3d"
+DATA_DIR = BASE_DIR / "data"
 
 data_cache = DataCache(DATA_DIR)
 

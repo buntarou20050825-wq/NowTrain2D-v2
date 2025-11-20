@@ -43,7 +43,8 @@ NowTrain-v2/
 ### 前提条件
 
 - Node.js (v18 以上推奨)
-- **Python 3.9 以上（3.10 推奨）**
+- **Python 3.10 以上（3.11 推奨）**
+  - MS2 までは 3.9 でも動作しましたが、MS3-1 以降は型ヒント・標準ライブラリの都合により 3.10+ を前提とします
 - Mapbox アクセストークン（[こちら](https://account.mapbox.com/access-tokens/)から取得）
 
 ### フロントエンド
@@ -188,11 +189,35 @@ FRONTEND_URL=http://localhost:5173,http://127.0.0.1:5173
 - [ ] ブラウザコンソールに `/api/lines` の結果が表示される
 - [ ] フロントとバックを同時に起動しても CORS エラーが出ない
 
+## MS3-1: 山手線の時刻表読み込み
+
+### データ準備
+
+バックエンドは `backend/main.py` から見て `../data` を参照します。時刻表データは既に `data/train-timetables/jreast-yamanote.json` に配置されています。
+
+### 内部データ構造
+
+- 起動時に `DataCache.yamanote_trains` に `TimetableTrain` の配列としてロードされます
+- `service_type` は id の末尾から推定（例: `Weekday`, `Holiday`）
+  - 当てはまらない場合は `'Unknown'` となり、ログに情報が出力されます
+- 終着駅が複数ある場合（`ds` が複数要素を持つ場合）は、そのまま複数保持します
+- 日跨ぎ補正により、23時台→0時台の時刻が正しく24時間加算されます
+
+### MS3-1 完了の確認項目
+
+- [ ] `backend/timetable_models.py` が作成され、`StopTime` / `TimetableTrain` が定義されている
+- [ ] `backend/data_cache.py` に時刻表読み込み機能が追加されている
+- [ ] バックエンド起動時に `Loaded X Yamanote timetable trains` のログが表示される
+- [ ] バックエンド起動時に `Yamanote service types: [...]` のログが表示される
+- [ ] 既存の API (`/api/lines` など) が引き続き正常に動作している
+
 ## 開発ロードマップ
 
 - **MS1**: プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
-- **MS2** (現在): FastAPI で静的データを API 化
-- **MS3**: 時刻表ベースの列車シミュレーション
+- **MS2**: FastAPI で静的データを API 化 ✅
+- **MS3-1** (現在): 山手線の時刻表読み込みと日跨ぎ正規化
+- **MS3-2**: 時刻表ベースの列車位置計算
+- **MS3-3**: 列車位置 API の実装
 - **MS4**: GTFS-RT との統合
 - **MS5**: UI/UX 強化
 - **MS6**: パフォーマンス調整・デプロイ・仕上げ
