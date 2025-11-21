@@ -428,13 +428,220 @@ curl "http://localhost:8000/api/yamanote/positions?now=2025-01-20T08:00:00%2B09:
 - [x] 走行中の列車が駅間で補間された座標を持っている
 - [x] API ドキュメント（`/docs`）で新しいエンドポイントが確認できる
 
+## MS3-4: フロントエンドで列車をリアルタイム表示
+
+### 概要
+
+MS3-4 では、バックエンド API から取得した列車位置を、フロントエンドの地図上にマーカーとして表示します。
+- **ポーリング方式**: 2秒ごとに `/api/yamanote/positions` から最新の列車位置を取得
+- **マーカー表示**: Mapbox GL JS の circle レイヤーで列車を可視化
+- **状態による色分け**: 停車中（グレー）/走行中（黄緑）で視覚的に区別
+
+### 実装内容
+
+#### frontend/src/App.jsx (拡張)
+
+**列車マーカー用のレイヤー追加:**
+
+地図ロード時に、列車を表示するための GeoJSON ソースとレイヤーを追加：
+
+```javascript
+map.addSource("yamanote-trains", {
+  type: "geojson",
+  data: {
+    type: "FeatureCollection",
+    features: [],
+  },
+});
+
+map.addLayer({
+  id: "yamanote-trains-circle",
+  type: "circle",
+  source: "yamanote-trains",
+  paint: {
+    "circle-radius": [
+      "interpolate",
+      ["linear"],
+      ["zoom"],
+      10, 4,  // ズーム10で半径4px
+      14, 8,  // ズーム14で半径8px
+    ],
+    "circle-stroke-width": 2,
+    "circle-stroke-color": "#ffffff",
+    "circle-color": [
+      "case",
+      ["==", ["get", "is_stopped"], true],
+      "#555555",  // 停車中: グレー
+      "#80C342",  // 走行中: 山手線の黄緑
+    ],
+    "circle-opacity": 0.9,
+  },
+});
+```
+
+**ポーリング機能の実装:**
+
+2つ目の `useEffect` でポーリングを実装：
+
+```javascript
+const TRAIN_UPDATE_INTERVAL_MS = 2000;  // 2秒ごとに更新
+
+useEffect(() => {
+  let intervalId = null;
+
+  const fetchAndUpdate = async () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const src = map.getSource("yamanote-trains");
+    if (!src) return;
+
+    try {
+      const res = await fetch("/api/yamanote/positions");
+      if (!res.ok) {
+        console.error("[yamanote] fetch error:", res.status);
+        return;
+      }
+      const json = await res.json();
+      const positions = json.positions || [];
+
+      // GeoJSON Features に変換
+      const features = positions.map((p) => ({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [p.lon, p.lat],
+        },
+        properties: { ...p },
+      }));
+
+      // ソースのデータを更新
+      src.setData({
+        type: "FeatureCollection",
+        features,
+      });
+      console.log(`[yamanote] Updated ${features.length} trains`);
+    } catch (err) {
+      console.error("[yamanote] error:", err);
+    }
+  };
+
+  const startPolling = () => {
+    fetchAndUpdate();  // 初回実行
+    intervalId = setInterval(fetchAndUpdate, TRAIN_UPDATE_INTERVAL_MS);
+  };
+
+  const map = mapRef.current;
+  if (map) {
+    if (map.loaded()) {
+      startPolling();
+    } else {
+      map.on("load", startPolling);
+    }
+  }
+
+  return () => {
+    if (intervalId) clearInterval(intervalId);
+    if (map) map.off("load", startPolling);
+  };
+}, []);
+```
+
+**主要な処理:**
+1. 地図がロードされたら、ポーリングを開始
+2. 2秒ごとに `/api/yamanote/positions` から列車位置を取得
+3. レスポンスを GeoJSON Features に変換
+4. `yamanote-trains` ソースのデータを更新（マーカーが自動的に再描画される）
+5. コンポーネントのアンマウント時にインターバルをクリア
+
+#### frontend/vite.config.js (拡張)
+
+**プロキシ設定の追加:**
+
+開発サーバーに API プロキシを設定し、CORS の問題を回避：
+
+```javascript
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+    },
+  },
+})
+```
+
+この設定により、フロントエンド（http://localhost:5173）から `/api/*` へのリクエストが、バックエンド（http://localhost:8000）にプロキシされます。
+
+### 技術的なポイント
+
+#### マーカーの色分け
+
+Mapbox GL JS の `case` 式を使って、列車の状態に応じて色を動的に変更：
+
+- **停車中** (`is_stopped: true`): `#555555` (グレー)
+- **走行中** (`is_stopped: false`): `#80C342` (山手線の黄緑)
+
+#### ズーム対応
+
+`interpolate` 式を使って、ズームレベルに応じてマーカーサイズを変更：
+
+- ズーム 10: 半径 4px（広域表示時は小さく）
+- ズーム 14: 半径 8px（詳細表示時は大きく）
+
+#### パフォーマンス考慮
+
+- GeoJSON ソースの `setData()` メソッドを使用することで、効率的にマーカーを更新
+- レイヤーを再作成せず、データのみを更新するため、描画パフォーマンスが向上
+
+### 動作確認
+
+**必要な手順:**
+
+1. バックエンドを起動
+   ```bash
+   cd backend
+   uvicorn main:app --reload --port 8000
+   ```
+
+2. フロントエンドを起動
+   ```bash
+   cd frontend
+   npm run dev
+   ```
+
+3. ブラウザで http://localhost:5173 を開く
+
+**確認ポイント:**
+- 地図上に山手線の路線と駅が表示される
+- 2秒ごとにコンソールに `[yamanote] Updated X trains` のログが表示される
+- 地図上に列車を表す円形マーカーが表示される
+- マーカーの色が停車中（グレー）/走行中（黄緑）で変わる
+- ズームイン/アウトでマーカーサイズが変化する
+- マーカーが時刻に応じて移動する（時刻表ベースの位置計算）
+
+### MS3-4 完了の確認項目
+
+- [x] `frontend/src/App.jsx` に列車マーカー用のレイヤーが追加されている
+- [x] ポーリング機能が実装されている（2秒ごとに API を呼び出し）
+- [x] `/api/yamanote/positions` から取得したデータを GeoJSON に変換している
+- [x] `frontend/vite.config.js` にプロキシ設定が追加されている
+- [x] 地図上に列車マーカーが表示される
+- [x] マーカーの色が停車中/走行中で変わる
+- [x] ズームレベルに応じてマーカーサイズが変化する
+- [x] コンソールに列車数の更新ログが表示される
+
 ## 開発ロードマップ
 
 - **MS1**: プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
 - **MS2**: FastAPI で静的データを API 化 ✅
 - **MS3-1**: 山手線の時刻表読み込みと日跨ぎ正規化 ✅
 - **MS3-2**: 時刻表ベースの列車位置計算 ✅
-- **MS3-3** (現在): 列車位置 API の実装 ✅
+- **MS3-3**: 列車位置 API の実装 ✅
+- **MS3-4** (現在): フロントエンドで列車をリアルタイム表示 ✅
 - **MS4**: GTFS-RT との統合
 - **MS5**: UI/UX 強化
 - **MS6**: パフォーマンス調整・デプロイ・仕上げ
