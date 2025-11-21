@@ -148,15 +148,24 @@ uvicorn main:app --reload --port 8000
 FRONTEND_URL=http://localhost:5173,http://127.0.0.1:5173
 ```
 
-## API 仕様（MS2）
+## API 仕様
 
 バックエンドは以下の API エンドポイントを提供します。詳細は http://localhost:8000/docs で確認できます。
+
+### 静的データ API（MS2）
 
 - `GET /api/health` - ヘルスチェック
 - `GET /api/lines` - 全路線一覧（`operator` パラメータでフィルタ可能）
 - `GET /api/lines/{lineId}` - 特定路線の詳細
 - `GET /api/stations?lineId={lineId}` - 指定路線の駅一覧
 - `GET /api/shapes?lineId={lineId}` - 指定路線の形状（GeoJSON）
+
+### 列車位置 API（MS3-3）
+
+- `GET /api/yamanote/positions` - 山手線の列車位置一覧
+  - パラメータ: `now` (Optional[str]) - JST の日時（ISO8601形式）
+  - 未指定時はサーバー現在時刻を使用
+  - レスポンス: 列車位置の配列、列車数、タイムスタンプ
 
 ## MS1 完了の確認項目
 
@@ -296,13 +305,136 @@ python test_train_state.py
 - [x] 走行中の列車の進捗度が 0.0〜1.0 で計算される
 - [x] 停車中の列車が駅ID とともに正しく検出される
 
+## MS3-3: 列車位置 API の実装
+
+### 概要
+
+MS3-3 では、MS3-2 で計算した抽象的な列車位置に地図座標を付与し、API として提供します。
+- 対象は **山手線のみ** (`JR-East.Yamanote`)
+- **駅間は直線補間** → 実際の線路形状は考慮しない（簡易実装）
+- 将来的に GTFS-RT 統合でリアルタイム位置に差し替え予定
+
+### 実装内容
+
+#### backend/train_position.py (新規作成)
+
+列車の抽象的な状態（`TrainSectionState`）を地図座標付きの位置（`TrainPosition`）に変換するモジュール。
+
+**データクラス:**
+- `TrainPosition`: 列車の地図上の位置と付随情報
+  - 列車ID、路線、方向、停車/走行状態
+  - 座標（`lon`, `lat`）
+  - 進捗度（0.0〜1.0）
+  - GTFS-RT 統合用フィールド（`is_scheduled`, `delay_seconds`）
+
+**Pydantic モデル:**
+- `TrainPositionResponse`: API レスポンス用の列車位置
+- `YamanotePositionsResponse`: `/api/yamanote/positions` のレスポンスラッパー
+  - `positions`: 列車位置の配列
+  - `count`: 列車数
+  - `timestamp`: リクエスト時刻（JST, ISO8601）
+
+**主要関数:**
+- `_get_station_coord()`: 駅IDから座標を取得
+- `_interpolate_coords()`: 駅A→駅B間の進捗に応じて線形補間した座標を返す
+- `train_state_to_position()`: `TrainSectionState` → `TrainPosition` 変換
+  - 停車中: 駅座標そのものを使用
+  - 走行中: from/to 駅間を直線補間
+- `get_yamanote_train_positions()`: 指定時刻の全列車位置を取得
+- `debug_dump_positions_at()`: デバッグ用の位置情報ダンプ
+
+#### backend/data_cache.py (拡張)
+
+**追加内容:**
+- `_is_valid_coord()`: 座標が日本付近の妥当な範囲にあるかチェック
+  - 経度: 122.0〜154.0
+  - 緯度: 20.0〜46.0
+- `station_positions`: 駅ID → (lon, lat) のインデックス（`Dict[str, tuple[float, float]]`）
+- `load_all()` 内で駅座標インデックスを構築
+  - 全駅の座標を読み込み
+  - 座標の妥当性を検証
+  - 山手線時刻表で使用されている駅IDが全て存在するか検証
+
+#### backend/main.py (拡張)
+
+**新しいエンドポイント:**
+
+```
+GET /api/yamanote/positions
+```
+
+**パラメータ:**
+- `now` (Optional[str]): JST の日時（ISO8601形式）
+  - 例: `2025-01-20T08:00:00+09:00`
+  - 未指定の場合はサーバー現在時刻（JST）を使用
+  - タイムゾーン無しの場合は JST とみなす
+
+**レスポンス例:**
+```json
+{
+  "positions": [
+    {
+      "train_id": "JR-East.Yamanote.400G.Weekday",
+      "base_id": "JR-East.Yamanote.400G",
+      "number": "400G",
+      "service_type": "Weekday",
+      "line_id": "JR-East.Yamanote",
+      "direction": "InnerLoop",
+      "is_stopped": false,
+      "station_id": null,
+      "from_station_id": "JR-East.Yamanote.Shibuya",
+      "to_station_id": "JR-East.Yamanote.Harajuku",
+      "progress": 0.45,
+      "lon": 139.7012,
+      "lat": 35.6696,
+      "current_time_sec": 14400,
+      "is_scheduled": true,
+      "delay_seconds": 0
+    }
+  ],
+  "count": 1,
+  "timestamp": "2025-01-20T08:00:00+09:00"
+}
+```
+
+### 動作確認
+
+**APIエンドポイントのテスト:**
+
+```bash
+# 現在時刻の列車位置を取得
+curl http://localhost:8000/api/yamanote/positions
+
+# 特定時刻の列車位置を取得
+curl "http://localhost:8000/api/yamanote/positions?now=2025-01-20T08:00:00%2B09:00"
+```
+
+確認ポイント:
+- レスポンスに列車位置の配列が含まれている
+- 各列車に `lon`, `lat` 座標が設定されている
+- 停車中の列車は駅座標と一致している
+- 走行中の列車は from/to 駅間の座標になっている
+- `progress` が 0.0〜1.0 の範囲内である
+
+### MS3-3 完了の確認項目
+
+- [x] `backend/train_position.py` が作成されている
+- [x] `backend/data_cache.py` に `station_positions` フィールドが追加されている
+- [x] バックエンド起動時に `Built X station positions` のログが表示される
+- [x] `GET /api/yamanote/positions` エンドポイントが実装されている
+- [x] `now` パラメータで時刻指定が可能
+- [x] レスポンスに列車の座標（lon, lat）が含まれている
+- [x] 停車中の列車が駅座標と一致している
+- [x] 走行中の列車が駅間で補間された座標を持っている
+- [x] API ドキュメント（`/docs`）で新しいエンドポイントが確認できる
+
 ## 開発ロードマップ
 
 - **MS1**: プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
 - **MS2**: FastAPI で静的データを API 化 ✅
 - **MS3-1**: 山手線の時刻表読み込みと日跨ぎ正規化 ✅
-- **MS3-2** (現在): 時刻表ベースの列車位置計算 ✅
-- **MS3-3**: 列車位置 API の実装
+- **MS3-2**: 時刻表ベースの列車位置計算 ✅
+- **MS3-3** (現在): 列車位置 API の実装 ✅
 - **MS4**: GTFS-RT との統合
 - **MS5**: UI/UX 強化
 - **MS6**: パフォーマンス調整・デプロイ・仕上げ
