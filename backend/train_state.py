@@ -115,7 +115,7 @@ def to_effective_seconds(dt_jst: datetime) -> int:
         service_date.year,
         service_date.month,
         service_date.day,
-        SERVICE_DAY_START_HOUR,
+        0,  # 00:00 からの秒数を計算する（時刻表データと合わせるため）
         0,
         0,
         tzinfo=dt_jst.tzinfo,

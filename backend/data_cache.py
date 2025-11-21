@@ -12,6 +12,12 @@ from train_state import TrainSegment, build_yamanote_segments
 logger = logging.getLogger(__name__)
 
 
+def _is_valid_coord(lon: float, lat: float) -> bool:
+    """
+    座標が日本付近の妥当な範囲にあるかざっくりチェックする
+    """
+    return (122.0 <= lon <= 154.0) and (20.0 <= lat <= 46.0)
+
 def _parse_time_to_seconds(time_str: str) -> int:
     """
     "HH:MM" または "HH:MM:SS" 形式の文字列を 0〜86399 の秒に変換する。
@@ -284,6 +290,9 @@ class DataCache:
         # MS3-2: 山手線のセグメント（TrainSegment の配列）
         self.yamanote_segments: List[TrainSegment] = []
 
+        # MS3-3: 駅座標インデックス
+        self.station_positions: Dict[str, tuple[float, float]] = {}
+
         # TODO (MS6): パフォーマンス最適化
         # self.railways_by_id: Dict[str, Dict[str, Any]] = {}
         # self.stations_by_id: Dict[str, Dict[str, Any]] = {}
@@ -331,3 +340,43 @@ class DataCache:
         # MS3-2: 山手線のセグメントを構築
         self.yamanote_segments = build_yamanote_segments(self.yamanote_trains)
         logger.info("Built %d Yamanote train segments", len(self.yamanote_segments))
+
+        # MS3-3: 駅座標インデックスの構築
+        station_positions: Dict[str, tuple[float, float]] = {}
+
+        for st in self.stations:
+            station_id = st.get("id")
+            coord = st.get("coord")
+
+            if not station_id or not coord or len(coord) < 2:
+                continue
+
+            lon, lat = float(coord[0]), float(coord[1])
+            if not _is_valid_coord(lon, lat):
+                logger.warning(
+                    "Station %s has invalid coord %s; skipping", station_id, coord
+                )
+                continue
+
+            station_positions[station_id] = (lon, lat)
+
+        self.station_positions = station_positions
+        logger.info("Built %d station positions", len(self.station_positions))
+
+        # MS3-3: 山手線時刻表の駅IDが station_positions に存在するか検証
+        missing_station_ids: set[str] = set()
+
+        for train in self.yamanote_trains:
+            for stop in train.stops:
+                if stop.station_id not in self.station_positions:
+                    missing_station_ids.add(stop.station_id)
+
+        if missing_station_ids:
+            logger.warning(
+                "Missing positions for %d station IDs used in Yamanote timetable "
+                "(first 10): %s",
+                len(missing_station_ids),
+                sorted(list(missing_station_ids))[:10],
+            )
+        else:
+            logger.info("All Yamanote timetable station IDs have positions")

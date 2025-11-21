@@ -1,7 +1,7 @@
 # backend/main.py
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from dotenv import load_dotenv
@@ -9,10 +9,19 @@ import os
 import logging
 from typing import Any, Dict, List, Optional
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from data_cache import DataCache
+from train_position import (
+    get_yamanote_train_positions,
+    TrainPositionResponse,
+    YamanotePositionsResponse,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+JST = ZoneInfo("Asia/Tokyo")
 
 load_dotenv()
 
@@ -197,3 +206,46 @@ async def get_shapes(lineId: Optional[str] = None):
         "type": "FeatureCollection",
         "features": [feature],
     }
+
+
+@app.get(
+    "/api/yamanote/positions",
+    response_model=YamanotePositionsResponse,
+    tags=["yamanote"],
+)
+async def api_yamanote_positions(
+    now: Optional[str] = Query(
+        default=None,
+        description=(
+            "JST の日時 (ISO8601)。"
+            "未指定の場合はサーバー現在時刻(JST)を使用。"
+            "例: 2025-01-20T08:00:00+09:00"
+        ),
+    ),
+):
+    """
+    山手線の「時刻表ベースの列車位置」を返す API。
+
+    - MS3-3 では、駅間を直線補間した簡易位置
+    - 将来、GTFS-RT 統合でリアルタイム位置に差し替え予定
+    """
+    try:
+        if now is None:
+            dt_jst = datetime.now(JST)
+        else:
+            dt = datetime.fromisoformat(now)
+            if dt.tzinfo is None:
+                # タイムゾーン無しの場合は JST とみなす
+                dt_jst = dt.replace(tzinfo=JST)
+            else:
+                dt_jst = dt.astimezone(JST)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid 'now' datetime: {e}")
+
+    positions = get_yamanote_train_positions(dt_jst, data_cache)
+
+    return YamanotePositionsResponse(
+        positions=[TrainPositionResponse.from_dataclass(p) for p in positions],
+        count=len(positions),
+        timestamp=dt_jst.isoformat(),
+    )
