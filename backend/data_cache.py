@@ -293,6 +293,10 @@ class DataCache:
         # MS3-3: 駅座標インデックス
         self.station_positions: Dict[str, tuple[float, float]] = {}
 
+        # MS3-5: 線路形状追従用
+        self.track_points: List[tuple[float, float]] = []  # 山手線全周の座標リスト
+        self.station_track_indices: Dict[str, int] = {}    # 駅ID → track_pointsのインデックス
+
         # TODO (MS6): パフォーマンス最適化
         # self.railways_by_id: Dict[str, Dict[str, Any]] = {}
         # self.stations_by_id: Dict[str, Dict[str, Any]] = {}
@@ -363,6 +367,9 @@ class DataCache:
         self.station_positions = station_positions
         logger.info("Built %d station positions", len(self.station_positions))
 
+        # MS3-5: 線路形状データの読み込みと駅マッピング
+        self._load_track_coordinates()
+
         # MS3-3: 山手線時刻表の駅IDが station_positions に存在するか検証
         missing_station_ids: set[str] = set()
 
@@ -380,3 +387,75 @@ class DataCache:
             )
         else:
             logger.info("All Yamanote timetable station IDs have positions")
+
+    def _load_track_coordinates(self) -> None:
+        """
+        MS3-5: coordinates.json から山手線の線路座標を読み込み、
+        各駅の最寄りインデックスを計算する。
+        """
+        # 1. coordinates.json をロード（既に load_all で self.coordinates にロード済み）
+        if not self.coordinates:
+            logger.warning("Coordinates data not loaded, skipping track loading")
+            return
+
+        # 2. JR-East.Yamanote の座標データを抽出
+        yamanote_coords: List[tuple[float, float]] = []
+        railways_coords = self.coordinates.get("railways", [])
+        
+        target_railway = None
+        for r in railways_coords:
+            if r.get("id") == "JR-East.Yamanote":
+                target_railway = r
+                break
+        
+        if not target_railway:
+            logger.warning("JR-East.Yamanote not found in coordinates.json")
+            return
+
+        sublines = target_railway.get("sublines", [])
+        for subline in sublines:
+            coords = subline.get("coords", [])
+            # リストのリストになっている場合があるので注意（データ構造依存）
+            # coordinates.json の仕様では coords は [[lon, lat], ...]
+            for c in coords:
+                if len(c) >= 2:
+                    yamanote_coords.append((float(c[0]), float(c[1])))
+
+        # 3. 隣接する重複座標を除去
+        self.track_points = []
+        for coord in yamanote_coords:
+            if not self.track_points or self.track_points[-1] != coord:
+                self.track_points.append(coord)
+        
+        logger.info("Loaded %d track points for Yamanote Line", len(self.track_points))
+
+        # 4. 各駅の最寄りインデックスを計算
+        self.station_track_indices = {}
+        
+        # 山手線の駅のみ対象
+        yamanote_station_ids = set()
+        for train in self.yamanote_trains:
+            for stop in train.stops:
+                yamanote_station_ids.add(stop.station_id)
+        
+        mapped_count = 0
+        for station_id in yamanote_station_ids:
+            coord = self.station_positions.get(station_id)
+            if not coord:
+                continue
+            
+            # 最も近い点を探索
+            min_dist = float('inf')
+            min_idx = 0
+            
+            for i, track_coord in enumerate(self.track_points):
+                # ユークリッド距離の2乗で比較（平方根計算を省略）
+                dist_sq = (coord[0] - track_coord[0]) ** 2 + (coord[1] - track_coord[1]) ** 2
+                if dist_sq < min_dist:
+                    min_dist = dist_sq
+                    min_idx = i
+            
+            self.station_track_indices[station_id] = min_idx
+            mapped_count += 1
+            
+        logger.info("Mapped %d stations to track indices", mapped_count)

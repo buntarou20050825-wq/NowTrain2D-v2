@@ -113,46 +113,171 @@ def _get_station_coord(
     return coord
 
 
+def _get_path_points(
+    start_idx: int,
+    end_idx: int,
+    direction: str,
+    track_points: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """
+    開始インデックスから終了インデックスまでの座標リストを取得する。
+    山手線は環状線なので、インデックスのラップアラウンドを考慮する。
+    
+    Args:
+        start_idx: 出発駅のtrack_pointsインデックス
+        end_idx: 到着駅のtrack_pointsインデックス
+        direction: "InnerLoop" or "OuterLoop"
+        track_points: 線路座標リスト（外回り順）
+    
+    Returns:
+        出発駅から到着駅までの座標リスト
+    """
+    if direction == "OuterLoop":
+        # 外回り: インデックス増加方向
+        if start_idx <= end_idx:
+            return track_points[start_idx : end_idx + 1]
+        else:
+            # ラップアラウンド（例: 品川→大崎→五反田）
+            return track_points[start_idx:] + track_points[: end_idx + 1]
+    else:
+        # 内回り: インデックス減少方向
+        if start_idx >= end_idx:
+            # Pythonのスライス [start:end:-1] は endを含まないので注意
+            # end_idx を含めるために end_idx-1 までとするが、end_idxが0の場合は特別扱いが必要
+            if end_idx == 0:
+                return track_points[start_idx::-1]
+            else:
+                return track_points[start_idx : end_idx - 1 : -1]
+        else:
+            # ラップアラウンド（例: 五反田→大崎→品川）
+            # 前半: start_idx -> 0
+            part1 = track_points[start_idx::-1]
+            # 後半: last -> end_idx
+            part2 = track_points[: end_idx - 1 : -1] if end_idx > 0 else track_points[::-1]
+            # 正確には track_points[end:] の逆順
+            part2 = track_points[: end_idx - 1 : -1] if end_idx > 0 else track_points[::-1]
+            
+            # シンプルに実装し直す: 全体を逆順にしたリストから抽出する方が安全かもしれないが、
+            # ここではインデックス操作で頑張る
+            
+            # part1: start_idx から 0 まで逆順
+            p1 = track_points[start_idx::-1]
+            # part2: 末尾 から end_idx まで逆順
+            p2 = track_points[: end_idx - 1 : -1] if end_idx > 0 else track_points[::-1]
+            # wait, track_points[: end_idx - 1 : -1] means from end (implicit) down to end_idx
+            # slice(None, end_idx-1, -1) -> start at last element, go down to end_idx
+            
+            return p1 + p2
+
+
+def _euclidean_distance(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
+    """2点間のユークリッド距離"""
+    return ((coord1[0] - coord2[0]) ** 2 + (coord1[1] - coord2[1]) ** 2) ** 0.5
+
+
+def _get_point_on_path(
+    path: list[tuple[float, float]], progress: float
+) -> tuple[float, float]:
+    """
+    パス上の総距離に基づき、進捗 progress (0.0~1.0) に対応する座標を計算する。
+    """
+    if not path:
+        return (0.0, 0.0)
+    if len(path) < 2:
+        return path[0]
+
+    if progress <= 0.0:
+        return path[0]
+    if progress >= 1.0:
+        return path[-1]
+
+    # 各セグメントの距離を計算
+    distances = []
+    total_distance = 0.0
+    for i in range(len(path) - 1):
+        d = _euclidean_distance(path[i], path[i + 1])
+        distances.append(d)
+        total_distance += d
+
+    if total_distance == 0:
+        return path[0]
+
+    # 目標距離
+    target_distance = progress * total_distance
+
+    # 目標距離に対応する点を探索
+    cumulative = 0.0
+    for i, d in enumerate(distances):
+        if cumulative + d >= target_distance:
+            # この区間内にある
+            if d == 0:
+                return path[i]
+            local_progress = (target_distance - cumulative) / d
+            # 線形補間
+            lon = path[i][0] + local_progress * (path[i + 1][0] - path[i][0])
+            lat = path[i][1] + local_progress * (path[i + 1][1] - path[i][1])
+            return (lon, lat)
+        cumulative += d
+
+    return path[-1]
+
+
 def _interpolate_coords(
     from_station_id: Optional[str],
     to_station_id: Optional[str],
     progress: float,
+    direction: str,
     cache: DataCache,
 ) -> Optional[tuple[float, float]]:
     """
-    駅 A → 駅 B 間の進捗 progress (0.0〜1.0) に応じて、
-    線形補間した座標を返す。
-
-    - どちらかの駅座標が無い場合は None を返す。
-    - progress は [0.0, 1.0] にクランプする。
+    駅 A → 駅 B 間の進捗 progress (0.0〜1.0) に応じて座標を返す。
+    MS3-5: 線路形状に沿ったパス補間を行う。
     """
     if from_station_id is None or to_station_id is None:
         return None
 
-    start = _get_station_coord(from_station_id, cache)
-    end = _get_station_coord(to_station_id, cache)
+    # フォールバック条件のチェック
+    # 1. 線路データがない
+    # 2. 駅がマッピングされていない
+    if (
+        not cache.track_points
+        or from_station_id not in cache.station_track_indices
+        or to_station_id not in cache.station_track_indices
+    ):
+        # 従来の直線補間（フォールバック）
+        start = _get_station_coord(from_station_id, cache)
+        end = _get_station_coord(to_station_id, cache)
 
-    if start is None or end is None:
-        logger.warning(
-            "Missing coordinates for segment %s → %s; skipping",
-            from_station_id,
-            to_station_id,
-        )
-        return None
+        if start is None or end is None:
+            return None
 
-    lon1, lat1 = start
-    lon2, lat2 = end
+        lon1, lat1 = start
+        lon2, lat2 = end
+        
+        # クランプ
+        progress = max(0.0, min(1.0, progress))
 
-    # クランプ
-    if progress < 0.0:
-        progress = 0.0
-    elif progress > 1.0:
-        progress = 1.0
+        lon = lon1 + (lon2 - lon1) * progress
+        lat = lat1 + (lat2 - lat1) * progress
+        return lon, lat
 
-    lon = lon1 + (lon2 - lon1) * progress
-    lat = lat1 + (lat2 - lat1) * progress
+    # Polyline補間
+    start_idx = cache.station_track_indices[from_station_id]
+    end_idx = cache.station_track_indices[to_station_id]
 
-    return lon, lat
+    path = _get_path_points(start_idx, end_idx, direction, cache.track_points)
+    return _get_point_on_path(path, progress)
+
+
+def _linear_interpolate(
+    from_coord: tuple[float, float],
+    to_coord: tuple[float, float],
+    progress: float,
+) -> tuple[float, float]:
+    """従来の直線補間（フォールバック用）"""
+    lon = from_coord[0] + progress * (to_coord[0] - from_coord[0])
+    lat = from_coord[1] + progress * (to_coord[1] - from_coord[1])
+    return (lon, lat)
 
 
 def train_state_to_position(
@@ -209,7 +334,7 @@ def train_state_to_position(
     from_id = state.from_station_id
     to_id = state.to_station_id
 
-    coords = _interpolate_coords(from_id, to_id, state.progress, cache)
+    coords = _interpolate_coords(from_id, to_id, state.progress, train.direction, cache)
     if coords is None:
         return None
 
