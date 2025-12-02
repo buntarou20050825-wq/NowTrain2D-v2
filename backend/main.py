@@ -249,3 +249,52 @@ async def api_yamanote_positions(
         count=len(positions),
         timestamp=dt_jst.isoformat(),
     )
+
+
+from gtfs_rt_vehicle import fetch_yamanote_positions, YamanoteTrainPosition
+
+@app.get("/api/trains/yamanote/positions")
+async def get_yamanote_positions():
+    """
+    山手線のリアルタイム列車位置を取得
+    
+    Returns:
+        {
+            "timestamp": 1760072237,
+            "trains": [
+                {
+                    "tripId": "4201301G",
+                    "trainNumber": "301G",
+                    "direction": "OuterLoop",
+                    "latitude": 35.7204,
+                    "longitude": 139.7063,
+                    "stopSequence": 11,
+                    "status": 1
+                },
+                ...
+            ]
+        }
+    """
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    
+    try:
+        positions = await fetch_yamanote_positions(api_key)
+        
+        return {
+            "timestamp": positions[0].timestamp if positions else 0,
+            "count": len(positions),
+            "trains": [
+                {
+                    "tripId": p.trip_id,
+                    "trainNumber": p.train_number,
+                    "direction": p.direction,
+                    "latitude": p.latitude,
+                    "longitude": p.longitude,
+                    "stopSequence": p.stop_sequence,
+                    "status": p.status
+                }
+                for p in positions
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
