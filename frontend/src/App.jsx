@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { fetchRailways, fetchStations, fetchCoordinates } from "./api/staticData";
@@ -50,6 +50,17 @@ const YAMANOTE_STATIONS = [
 function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
+  // ========== 列車追跡機能 ==========
+  const [trackedTrain, setTrackedTrain] = useState(null);
+  const trackedTrainRef = useRef(null);  // useEffect内からアクセス用
+
+  // trackedTrainが変更されたらrefも更新
+  useEffect(() => {
+    trackedTrainRef.current = trackedTrain;
+    if (trackedTrain) {
+      console.log(`%c[TRACKING] 追跡開始: ${trackedTrain}`, 'background: blue; color: white; font-size: 14px;');
+    }
+  }, [trackedTrain]);
 
   useEffect(() => {
     if (mapRef.current) return;
@@ -296,13 +307,16 @@ function App() {
               "interpolate",
               ["linear"],
               ["zoom"],
-              10, 4,
-              14, 8,
+              10, ["case", ["==", ["get", "trainNumber"], trackedTrain || ""], 8, 4],
+              14, ["case", ["==", ["get", "trainNumber"], trackedTrain || ""], 12, 8],
             ],
             "circle-stroke-width": 2,
             "circle-stroke-color": "#ffffff",
             "circle-color": [
               "case",
+              // 追跡中は赤
+              ["==", ["get", "trainNumber"], trackedTrain || ""],
+              "#FF0000",
               // 補間中は黄色
               ["==", ["get", "interpolated"], true],
               "#FFEB3B",
@@ -422,11 +436,18 @@ function App() {
               source = 'interpolated';
               interpolated = true;
             } else {
-              // 次駅到着時刻を過ぎた → GTFS-RTの座標
-              lat = train.latitude;
-              lon = train.longitude;
-              source = 'gtfs-rt';
-              interpolated = false;
+              // 次駅到着時刻を過ぎた → 次駅の座標で待機（GTFS-RT更新待ち）
+              if (nextStation) {
+                lat = nextStation.lat;
+                lon = nextStation.lon;
+                source = 'arrived-waiting';  // GTFS-RT更新待ち状態
+                interpolated = false;
+              } else {
+                lat = train.latitude;
+                lon = train.longitude;
+                source = 'gtfs-rt';
+                interpolated = false;
+              }
             }
           } else {
             // 時刻情報がない → GTFS-RTの座標をそのまま使用
@@ -461,6 +482,39 @@ function App() {
               currentStation,
               nextStation,
             });
+          }
+
+          // 追跡中の列車を詳細ログ
+          if (trackedTrainRef.current && train.trainNumber === trackedTrainRef.current) {
+            console.log(`%c[TRACKED ${trackedTrainRef.current}] ===========================`, 'background: #222; color: #bada55; font-size: 14px;');
+            console.log({
+              raw: {
+                stopSequence: train.stopSequence,
+                latitude: train.latitude,
+                longitude: train.longitude,
+                departureTime: train.departureTime,
+                nextArrivalTime: train.nextArrivalTime,
+              },
+              calculated: {
+                currentStationIndex,
+                nextStationIndex,
+                currentStation: currentStation?.id,
+                nextStation: nextStation?.id,
+                source,
+                interpolated,
+                progress: interpolated ? ((now - train.departureTime) / (train.nextArrivalTime - train.departureTime)).toFixed(2) : 'N/A',
+                lat,
+                lon,
+              },
+              time: {
+                now,
+                departureTime: train.departureTime,
+                nextArrivalTime: train.nextArrivalTime,
+                sinceDeparture: now - train.departureTime,
+                untilArrival: train.nextArrivalTime - now,
+              }
+            });
+            console.log(`%c[TRACKED ${trackedTrainRef.current}] ===========================`, 'background: #222; color: #bada55; font-size: 14px;');
           }
 
           return {
@@ -501,6 +555,25 @@ function App() {
 
         const interpolatedCount = positions.filter(p => p.interpolated).length;
         console.log(`[hybrid] trains: ${positions.length}, interpolated: ${interpolatedCount}`);
+
+        // 消失検知
+        if (trackedTrainRef.current) {
+          const found = positions.find(p => p.trainNumber === trackedTrainRef.current);
+          if (found) {
+            // 追跡中の列車が見つかった - 状態をサマリー表示
+            console.log(`%c[TRACKED ${trackedTrainRef.current}] 状態: ${found.source} | 駅: ${YAMANOTE_STATIONS[found.currentStationIndex]?.id} → ${YAMANOTE_STATIONS[found.nextStationIndex]?.id}`,
+              'background: green; color: white;');
+          } else {
+            console.error(`%c[TRACKED ${trackedTrainRef.current}] ⚠️⚠️⚠️ 消失！positionsに存在しない`, 'background: red; color: white; font-size: 16px;');
+            // APIのrawデータも確認
+            const rawFound = data.find(t => t.trainNumber === trackedTrainRef.current);
+            if (rawFound) {
+              console.error(`[TRACKED ${trackedTrainRef.current}] APIには存在するがpositionsから除外された:`, rawFound);
+            } else {
+              console.error(`[TRACKED ${trackedTrainRef.current}] APIレスポンス自体に存在しない`);
+            }
+          }
+        }
       } catch (err) {
         console.error("[hybrid] error:", err);
       }
@@ -526,7 +599,32 @@ function App() {
     };
   }, []);
 
-  return <div ref={mapContainerRef} style={{ width: "100vw", height: "100vh" }} />;
+  return (
+    <div style={{ position: 'relative', width: "100vw", height: "100vh" }}>
+      {/* 列車追跡UI */}
+      <div style={{
+        position: 'absolute',
+        top: 10,
+        left: 10,
+        zIndex: 1000,
+        background: 'white',
+        padding: '10px',
+        borderRadius: '5px',
+        boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
+      }}>
+        <input
+          type="text"
+          placeholder="列車番号 (例: 005G)"
+          onChange={(e) => setTrackedTrain(e.target.value.toUpperCase() || null)}
+          style={{ width: '120px', marginRight: '5px' }}
+        />
+        <span style={{ fontSize: '12px', color: '#666' }}>
+          {trackedTrain ? `追跡中: ${trackedTrain}` : '未選択'}
+        </span>
+      </div>
+      <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
+    </div>
+  );
 }
 
 export default App;
