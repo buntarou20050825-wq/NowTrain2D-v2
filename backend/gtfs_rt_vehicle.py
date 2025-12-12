@@ -2,6 +2,7 @@
 GTFS-RT VehiclePosition から山手線の列車位置を取得
 """
 import os
+import re
 import httpx
 import asyncio
 from google.transit import gtfs_realtime_pb2
@@ -70,9 +71,37 @@ def get_direction(trip_id: str) -> str:
 
 
 def get_train_number(trip_id: str) -> str:
-    """列車番号を抽出（静的時刻表との照合用）"""
-    # "4201301G" → "301G"
-    return trip_id[4:]
+    """
+    Trip ID から列車番号を抽出する（4桁プレフィックススキップ + ゼロ埋め除去）
+    
+    山手線のtrip_idは「4桁プレフィックス + 列車番号」の形式。
+    例: "4201301G" → "301G", "42020906G" → "906G"
+    
+    Args:
+        trip_id: GTFS Trip ID (例: "4201301G", "42020906G")
+    
+    Returns:
+        抽出・正規化された列車番号 (例: "301G", "906G")
+    """
+    # 4桁のプレフィックスをスキップ
+    if len(trip_id) <= 4:
+        return trip_id
+    
+    suffix = trip_id[4:]  # 例: "0906G" or "301G"
+    
+    # 末尾の "数字 + 英字" パターンをマッチ
+    match = re.match(r'^(\d+)([A-Z])$', suffix)
+    if match:
+        number_part = match.group(1)
+        letter = match.group(2)
+        
+        # 数値化して先頭の0を削除 (例: "0906" -> 906 -> "906")
+        normalized_number = str(int(number_part))
+        
+        return f"{normalized_number}{letter}"
+    
+    # マッチしない場合はそのまま返す
+    return suffix
 
 
 async def fetch_yamanote_positions(api_key: str) -> list[YamanoteTrainPosition]:
