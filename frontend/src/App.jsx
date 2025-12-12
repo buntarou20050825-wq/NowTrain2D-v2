@@ -52,14 +52,14 @@ function App() {
   const mapRef = useRef(null);
   // ========== 列車追跡機能 ==========
   const [trackedTrain, setTrackedTrain] = useState(null);
-  const trackedTrainRef = useRef(null);  // useEffect内からアクセス用
+  const trackedTrainRef = useRef(null);
 
-  // trackedTrainが変更されたらrefも更新
+  // ========== GTFS-RT更新遅延計測用 ==========
+  const trainStatesRef = useRef({});  // { trainNumber: { stopSeq, lastUpdate } }
+
+  // trackedTrain同期
   useEffect(() => {
     trackedTrainRef.current = trackedTrain;
-    if (trackedTrain) {
-      console.log(`%c[TRACKING] 追跡開始: ${trackedTrain}`, 'background: blue; color: white; font-size: 14px;');
-    }
   }, [trackedTrain]);
 
   useEffect(() => {
@@ -317,14 +317,23 @@ function App() {
               // 追跡中は赤
               ["==", ["get", "trainNumber"], trackedTrain || ""],
               "#FF0000",
-              // 補間中は黄色
-              ["==", ["get", "interpolated"], true],
+              // dataQuality: good (ブレンド成功) = 青
+              ["==", ["get", "dataQuality"], "good"],
+              "#2196F3",
+              // dataQuality: stale (古いGTFS-RT) = 水色
+              ["==", ["get", "dataQuality"], "stale"],
+              "#00BCD4",
+              // dataQuality: rejected (乖離大) = 紫
+              ["==", ["get", "dataQuality"], "rejected"],
+              "#9C27B0",
+              // dataQuality: timetable_only = 黄色
+              ["==", ["get", "dataQuality"], "timetable_only"],
               "#FFEB3B",
-              // GTFS-RT（外回り）は緑
-              ["==", ["get", "direction"], "OuterLoop"],
+              // 停車中（外回り）は緑
+              ["all", ["==", ["get", "isStopped"], true], ["==", ["get", "direction"], "OuterLoop"]],
               "#80C342",
-              // GTFS-RT（内回り）はオレンジ
-              ["==", ["get", "direction"], "InnerLoop"],
+              // 停車中（内回り）はオレンジ
+              ["all", ["==", ["get", "isStopped"], true], ["==", ["get", "direction"], "InnerLoop"]],
               "#FF9500",
               // フォールバック
               "#80C342",
@@ -382,8 +391,8 @@ function App() {
       if (!src) return;
 
       try {
-        // v2 API（出発時刻付き）を使用
-        const res = await fetch("/api/trains/yamanote/positions/v2");
+        // v3 API（出発時刻付き）を使用
+        const res = await fetch("/api/trains/yamanote/positions/v3");
         if (!res.ok) return;
         const json = await res.json();
         const gtfsTrains = json.trains || [];
@@ -407,134 +416,82 @@ function App() {
         // ★ デバッグ: 現在時刻とdepartureTimeの比較
         console.log('[debug] now:', now, 'date:', new Date(now * 1000).toLocaleTimeString('ja-JP'));
 
-        const positions = gtfsTrains.map(train => {
-          const currentStationIndex = stopSeqToStationIndex(train.stopSequence, train.direction);
-          const nextStationIndex = getNextStationIndex(currentStationIndex, train.direction);
+        // ========== stopSequence変化検知（GTFS-RT遅延計測用） ==========
+        for (const train of gtfsTrains) {
+          const prevState = trainStatesRef.current[train.trainNumber];
 
-          const currentStation = YAMANOTE_STATIONS[currentStationIndex];
-          const nextStation = YAMANOTE_STATIONS[nextStationIndex];
+          if (prevState && prevState.stopSeq !== train.stopSequence) {
+            // stopSequenceが変わった！= 新しい駅に到着した
+            const prevStationIdx = stopSeqToStationIndex(prevState.stopSeq, train.direction);
+            const newStationIdx = stopSeqToStationIndex(train.stopSequence, train.direction);
+            const prevStation = YAMANOTE_STATIONS[prevStationIdx]?.id || '?';
+            const newStation = YAMANOTE_STATIONS[newStationIdx]?.id || '?';
 
-          let lat, lon, source, interpolated;
+            const detectTime = new Date(now * 1000).toLocaleTimeString('ja-JP');
+            const departureTimeStr = train.departureTime
+              ? new Date(train.departureTime * 1000).toLocaleTimeString('ja-JP')
+              : 'N/A';
 
-          // 出発時刻と次駅到着時刻がある場合
-          if (train.departureTime && train.nextArrivalTime) {
-            if (now < train.departureTime) {
-              // まだ出発前 → GTFS-RTの座標（駅に停車中）
-              lat = train.latitude;
-              lon = train.longitude;
-              source = 'gtfs-rt';
-              interpolated = false;
-            } else if (now >= train.departureTime && now < train.nextArrivalTime) {
-              // 出発後、次駅到着前 → 時刻表ベースで補間
-              const totalDuration = train.nextArrivalTime - train.departureTime;
-              const elapsed = now - train.departureTime;
-              const progress = Math.min(elapsed / totalDuration, 1.0);
+            // 遅延 = 検知時刻 - 出発時刻（マイナスなら出発前に検知）
+            const delay = train.departureTime ? (now - train.departureTime) : null;
 
-              const pos = interpolatePosition(currentStation, nextStation, progress);
-              lat = pos.lat;
-              lon = pos.lon;
-              source = 'interpolated';
-              interpolated = true;
-            } else {
-              // 次駅到着時刻を過ぎた → 次駅の座標で待機（GTFS-RT更新待ち）
-              if (nextStation) {
-                lat = nextStation.lat;
-                lon = nextStation.lon;
-                source = 'arrived-waiting';  // GTFS-RT更新待ち状態
-                interpolated = false;
-              } else {
-                lat = train.latitude;
-                lon = train.longitude;
-                source = 'gtfs-rt';
-                interpolated = false;
-              }
-            }
-          } else {
-            // 時刻情報がない → GTFS-RTの座標をそのまま使用
-            lat = train.latitude;
-            lon = train.longitude;
-            source = 'gtfs-rt';
-            interpolated = false;
-          }
-
-          // ★ デバッグ: 各列車の判定結果
-          console.log('[debug] train:', {
-            trainNumber: train.trainNumber,
-            direction: train.direction,
-            source,
-            interpolated,
-            progress: interpolated ? ((now - train.departureTime) / (train.nextArrivalTime - train.departureTime)).toFixed(2) : 'N/A',
-            currentIdx: currentStationIndex,
-            nextIdx: nextStationIndex,
-            currentStation: currentStation?.id,
-            nextStation: nextStation?.id,
-            lat: lat?.toFixed(4),
-            lon: lon?.toFixed(4),
-            gtfsLat: train.latitude?.toFixed(4),
-            gtfsLon: train.longitude?.toFixed(4),
-          });
-
-          // さらに、座標が無効な場合の警告
-          if (!lat || !lon || isNaN(lat) || isNaN(lon)) {
-            console.error('[hybrid] ⚠️ Invalid coords!', {
-              trainNumber: train.trainNumber,
-              lat, lon,
-              currentStation,
-              nextStation,
+            console.log(`%c[GTFS-RT更新検知] ${train.trainNumber}`, 'background: purple; color: white; font-size: 14px;');
+            console.log({
+              列車: train.trainNumber,
+              方向: train.direction,
+              区間変化: `${prevStation} → ${newStation}`,
+              stopSeq変化: `${prevState.stopSeq} → ${train.stopSequence}`,
+              検知時刻: detectTime,
+              新駅出発予定: departureTimeStr,
+              遅延秒数: delay !== null ? `${delay}秒` : 'N/A',
+              備考: delay !== null && delay > 0 ? '⚠️ 出発時刻を過ぎてから検知' : '✓ 出発前に検知',
             });
+            console.log('---');
           }
 
+          // 状態を更新
+          trainStatesRef.current[train.trainNumber] = {
+            stopSeq: train.stopSequence,
+            lastUpdate: now,
+          };
+        }
+
+        // v3 API は既にブレンド済みの座標を返すのでそのまま使用
+        const positions = gtfsTrains.map(train => {
           // 追跡中の列車を詳細ログ
           if (trackedTrainRef.current && train.trainNumber === trackedTrainRef.current) {
-            console.log(`%c[TRACKED ${trackedTrainRef.current}] ===========================`, 'background: #222; color: #bada55; font-size: 14px;');
+            console.log(`[TRACKED ${trackedTrainRef.current}] ===========================`);
             console.log({
-              raw: {
-                stopSequence: train.stopSequence,
+              fromBackend: {
                 latitude: train.latitude,
                 longitude: train.longitude,
-                departureTime: train.departureTime,
-                nextArrivalTime: train.nextArrivalTime,
-              },
-              calculated: {
-                currentStationIndex,
-                nextStationIndex,
-                currentStation: currentStation?.id,
-                nextStation: nextStation?.id,
-                source,
-                interpolated,
-                progress: interpolated ? ((now - train.departureTime) / (train.nextArrivalTime - train.departureTime)).toFixed(2) : 'N/A',
-                lat,
-                lon,
+                fromStation: train.fromStation,
+                toStation: train.toStation,
+                progress: train.progress,
+                direction: train.direction,
+                isStopped: train.isStopped,
+                stationId: train.stationId,
+                dataQuality: train.dataQuality,
               },
               time: {
                 now,
-                departureTime: train.departureTime,
-                nextArrivalTime: train.nextArrivalTime,
-                sinceDeparture: now - train.departureTime,
-                untilArrival: train.nextArrivalTime - now,
+                timestamp: json.timestamp,
               }
             });
-            console.log(`%c[TRACKED ${trackedTrainRef.current}] ===========================`, 'background: #222; color: #bada55; font-size: 14px;');
+            console.log(`[TRACKED ${trackedTrainRef.current}] ===========================`);
           }
 
           return {
-            lat,
-            lon,
+            lat: train.latitude,
+            lon: train.longitude,
             direction: train.direction,
-            tripId: train.tripId,
             trainNumber: train.trainNumber,
-            stopSequence: train.stopSequence,
-            status: train.status,
-            source,
-            interpolated,
-            // ポップアップ用に追加プロパティ
-            currentStationIndex,
-            nextStationIndex,
-            departureTime: train.departureTime,
-            nextArrivalTime: train.nextArrivalTime,
-            timestamp: train.timestamp,
-            gtfsLat: train.latitude,
-            gtfsLon: train.longitude,
+            fromStation: train.fromStation,
+            toStation: train.toStation,
+            progress: train.progress,
+            isStopped: train.isStopped,
+            stationId: train.stationId,
+            dataQuality: train.dataQuality,
           };
         });
 
@@ -553,25 +510,18 @@ function App() {
           features,
         });
 
-        const interpolatedCount = positions.filter(p => p.interpolated).length;
-        console.log(`[hybrid] trains: ${positions.length}, interpolated: ${interpolatedCount}`);
+        // dataQuality 別の集計
+        const qualityCounts = {};
+        positions.forEach(p => {
+          qualityCounts[p.dataQuality] = (qualityCounts[p.dataQuality] || 0) + 1;
+        });
+        console.log(`[v3 hybrid] trains: ${positions.length}`, qualityCounts);
 
         // 消失検知
-        if (trackedTrainRef.current) {
-          const found = positions.find(p => p.trainNumber === trackedTrainRef.current);
-          if (found) {
-            // 追跡中の列車が見つかった - 状態をサマリー表示
-            console.log(`%c[TRACKED ${trackedTrainRef.current}] 状態: ${found.source} | 駅: ${YAMANOTE_STATIONS[found.currentStationIndex]?.id} → ${YAMANOTE_STATIONS[found.nextStationIndex]?.id}`,
-              'background: green; color: white;');
-          } else {
-            console.error(`%c[TRACKED ${trackedTrainRef.current}] ⚠️⚠️⚠️ 消失！positionsに存在しない`, 'background: red; color: white; font-size: 16px;');
-            // APIのrawデータも確認
-            const rawFound = data.find(t => t.trainNumber === trackedTrainRef.current);
-            if (rawFound) {
-              console.error(`[TRACKED ${trackedTrainRef.current}] APIには存在するがpositionsから除外された:`, rawFound);
-            } else {
-              console.error(`[TRACKED ${trackedTrainRef.current}] APIレスポンス自体に存在しない`);
-            }
+        if (trackedTrain) {
+          const found = positions.find(p => p.trainNumber === trackedTrain);
+          if (!found) {
+            console.error(`[TRACKED ${trackedTrain}] ⚠️⚠️⚠️ 消失！APIレスポンスに存在しない`);
           }
         }
       } catch (err) {

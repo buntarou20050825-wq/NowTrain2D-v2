@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from data_cache import DataCache
 from train_position import (
     get_yamanote_train_positions,
+    get_blended_train_positions,
     TrainPositionResponse,
     YamanotePositionsResponse,
 )
@@ -324,9 +325,65 @@ async def get_yamanote_positions_v2():
                     # 新規追加
                     "departureTime": p.departure_time,
                     "nextArrivalTime": p.next_arrival_time,
+                    "timestamp": p.timestamp,  # GTFS-RT更新時刻
                 }
                 for p in positions
             ]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/trains/yamanote/positions/v3")
+async def get_yamanote_positions_v3():
+    """
+    時刻表 + GTFS-RT ハイブリッドの列車位置を返す (Phase 1)
+    """
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    
+    # 1. GTFS-RTを非同期で取得（失敗してもNoneで続行）
+    gtfs_data = None
+    try:
+        gtfs_list = await fetch_yamanote_positions(api_key)
+        # train_number をキーとする辞書に変換
+        gtfs_data = {pos.train_number: pos for pos in gtfs_list}
+        logger.info(f"GTFS-RT: {len(gtfs_data)} trains fetched")
+    except Exception as e:
+        logger.warning(f"GTFS-RT fetch failed, using timetable only: {e}")
+    
+    try:
+        # 2. 現在時刻を取得
+        current_time = datetime.now(JST)
+        
+        # 3. ブレンド処理を呼び出し
+        positions = get_blended_train_positions(
+            current_time,
+            data_cache,
+            gtfs_data
+        )
+        
+        # 4. レスポンスを構築
+        return {
+            "timestamp": current_time.isoformat(),
+            "gtfsAvailable": gtfs_data is not None,
+            "trainCount": len(positions),
+            "trains": [
+                {
+                    "trainNumber": pos.number,
+                    "latitude": pos.lat,
+                    "longitude": pos.lon,
+                    "fromStation": pos.from_station_id,
+                    "toStation": pos.to_station_id,
+                    "progress": pos.progress,
+                    "direction": pos.direction,
+                    "isStopped": pos.is_stopped,
+                    "stationId": pos.station_id,
+                    "dataQuality": pos.data_quality,
+                }
+                for pos in positions
+            ]
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in v3 endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

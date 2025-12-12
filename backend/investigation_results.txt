@@ -1,0 +1,140 @@
+============================================================
+1. GTFS-RT VehiclePosition データ構造
+============================================================
+
+取得した列車数: 31
+
+サンプルデータ (1件目):
+  trip_id:       4200901G
+  train_number:  901G
+  direction:     OuterLoop
+  latitude:      35.65541076660156
+  longitude:     139.7571258544922
+  stop_sequence: 27
+  status:        1
+  timestamp:     1765501876
+
+全列車のtrain_number一覧 (最初の10件):
+  901G (trip_id: 4200901G)
+  905G (trip_id: 4200905G)
+  907G (trip_id: 4200907G)
+  911G (trip_id: 4200911G)
+  913G (trip_id: 4200913G)
+  915G (trip_id: 4200915G)
+  917G (trip_id: 4200917G)
+  919G (trip_id: 4200919G)
+  929G (trip_id: 4200929G)
+  931G (trip_id: 4200931G)
+
+============================================================
+2. 時刻表のID形式
+============================================================
+
+時刻表の列車数: 1037
+
+サンプルデータ (1件目):
+  id:     JR-East.Yamanote.400G.Weekday
+  t:      JR-East.Yamanote.400G
+  r:      JR-East.Yamanote
+  n:      400G
+  y:      JR-East.Local
+  d:      InnerLoop
+  os:     ['JR-East.Yamanote.Osaki']
+  ds:     N/A
+
+  時刻表の最初の停車駅:
+    s: JR-East.Yamanote.Osaki, a: N/A, d: 04:30
+    s: JR-East.Yamanote.Shinagawa, a: N/A, d: 04:33
+    s: JR-East.Yamanote.TakanawaGateway, a: N/A, d: 04:35
+
+時刻表の全number一覧 (最初の10件):
+  n=400G, id=JR-East.Yamanote.400G.Weekday
+  n=402G, id=JR-East.Yamanote.402G.Weekday
+  n=460G, id=JR-East.Yamanote.460G.Weekday
+  n=504G, id=JR-East.Yamanote.504G.Weekday
+  n=562G, id=JR-East.Yamanote.562G.Weekday
+  n=506G, id=JR-East.Yamanote.506G.Weekday
+  n=500G, id=JR-East.Yamanote.500G.Weekday
+  n=508G, id=JR-East.Yamanote.508G.Weekday
+  n=510G, id=JR-East.Yamanote.510G.Weekday
+  n=502G, id=JR-East.Yamanote.502G.Weekday
+
+============================================================
+3. 駅IDの形式
+============================================================
+
+山手線の駅数: 33
+
+サンプル駅ID (最初の5件):
+  id: JR-East.Yamanote.Osaki
+    railway: JR-East.Yamanote
+    coord: [139.72816, 35.62019]
+
+  id: JR-East.Yamanote.Gotanda
+    railway: JR-East.Yamanote
+    coord: [139.72344, 35.6263]
+
+  id: JR-East.Yamanote.Meguro
+    railway: JR-East.Yamanote
+    coord: [139.71566, 35.63352]
+
+  id: JR-East.Yamanote.Ebisu
+    railway: JR-East.Yamanote
+    coord: [139.70983, 35.64658]
+
+  id: JR-East.Yamanote.Shibuya
+    railway: JR-East.Yamanote
+    coord: [139.70149, 35.65796]
+
+
+============================================================
+4. 区間座標（coordinates.json）の構造
+============================================================
+
+山手線のsubline数: 7
+
+最初のsublineの構造:
+  キー: ['type', 'start', 'coords', 'end']
+  座標点数: 53
+  最初の座標: [139.7289623, 35.6190932]
+  2番目の座標: [139.728662, 35.6194761]
+
+全sublineのキー/データサンプル:
+  [0] キー: ['type', 'start', 'coords', 'end'], 座標数: 53
+  [1] キー: ['type', 'start', 'coords', 'end', 'interpolate'], 座標数: 33
+  [2] キー: ['type', 'start', 'coords', 'end'], 座標数: 224
+
+============================================================
+5. DataCacheのstation_track_indices
+============================================================
+
+track_points数: 832
+station_track_indices数: 30
+
+サンプル駅インデックス (最初の5件):
+  JR-East.Yamanote.ShinOkubo: インデックス 231
+    座標: (139.7001103, 35.7005299)
+  JR-East.Yamanote.Ikebukuro: インデックス 302
+    座標: (139.7109518, 35.7302621)
+  JR-East.Yamanote.Osaki: インデックス 2
+    座標: (139.7280607, 35.6202427)
+  JR-East.Yamanote.Yoyogi: インデックス 180
+    座標: (139.7021489, 35.6833289)
+  JR-East.Yamanote.Nippori: インデックス 456
+    座標: (139.7711595, 35.7273551)
+
+============================================================
+6. train_id マッチング分析
+============================================================
+
+GTFS-RT train_numbers: 31 件
+時刻表 numbers: 696 件
+一致: 25 件
+
+一致例 (最初の5件): ['902G', '960G', '919G', '906G', '912G']
+
+GTFS-RTにのみ存在 (時刻表になし): ['003G', '023G', '074G', '033G', '064G', '000G']
+
+============================================================
+調査完了
+============================================================

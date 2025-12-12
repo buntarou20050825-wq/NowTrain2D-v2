@@ -4,12 +4,14 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 import logging
+import math
 
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from train_state import TrainSectionState
     from data_cache import DataCache
+    from gtfs_rt_vehicle import YamanoteTrainPosition
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ class TrainPosition:
     is_scheduled: bool = True     # 時刻表ベースの位置なら True
     delay_seconds: int = 0        # 遅延秒数（GTFS-RT統合時に使用）
     departure_time: Optional[int] = None # 発車予定時刻（秒）
+    data_quality: str = "timetable_only"  # "good", "stale", "rejected", "timetable_only", "error"
 
 
 class TrainPositionResponse(BaseModel):
@@ -73,6 +76,7 @@ class TrainPositionResponse(BaseModel):
     is_scheduled: bool
     delay_seconds: int
     departure_time: Optional[int]
+    data_quality: str
 
     @classmethod
     def from_dataclass(cls, pos: TrainPosition) -> "TrainPositionResponse":
@@ -450,3 +454,356 @@ def debug_dump_positions_at(
 
     if len(positions) > limit:
         print(f"\n... 他 {len(positions) - limit} 本\n")
+
+
+# ============================================================================
+# Phase 1: Geometry Helper Functions for Hybrid Position Estimation
+# ============================================================================
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    2点間の距離をメートルで返す（Haversine公式）
+    """
+    R = 6371000  # 地球の半径（メートル）
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def point_to_segment_distance(
+    px: float, py: float,  # ターゲット点 (lon, lat)
+    ax: float, ay: float,  # 線分始点 (lon, lat)
+    bx: float, by: float   # 線分終点 (lon, lat)
+) -> tuple[float, float, float, float]:
+    """
+    点から線分への最短距離と、最近接点の位置を返す。
+    
+    Returns:
+        (distance_m, nearest_lon, nearest_lat, t)
+        - distance_m: 最短距離（メートル）
+        - nearest_lon, nearest_lat: 最近接点の座標
+        - t: 線分上の位置パラメータ（0.0〜1.0）
+    """
+    dx = bx - ax
+    dy = by - ay
+    
+    if dx == 0 and dy == 0:
+        # 線分が点の場合
+        return haversine_distance(py, px, ay, ax), ax, ay, 0.0
+    
+    # 線分上のパラメータ t を計算
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))  # 0〜1にクランプ
+    
+    # 最近接点
+    nearest_lon = ax + t * dx
+    nearest_lat = ay + t * dy
+    
+    # 距離
+    dist = haversine_distance(py, px, nearest_lat, nearest_lon)
+    
+    return dist, nearest_lon, nearest_lat, t
+
+
+def get_segment_coords(
+    from_station_id: str,
+    to_station_id: str,
+    direction: str,
+    cache: "DataCache"
+) -> list[list[float]] | None:
+    """
+    駅間の座標列を取得する（環状線・方向対応版）。
+    
+    Args:
+        from_station_id: 出発駅ID（例: "JR-East.Yamanote.Shibuya"）
+        to_station_id: 到着駅ID（例: "JR-East.Yamanote.Ebisu"）
+        direction: 列車の進行方向（"OuterLoop" or "InnerLoop"）
+        cache: データキャッシュ
+    
+    Returns:
+        座標列 [[lon, lat], ...] または None（取得失敗時）
+        ※ 座標は from → to の順番で並ぶ（列車の進行方向）
+    """
+    from_idx = cache.station_track_indices.get(from_station_id)
+    to_idx = cache.station_track_indices.get(to_station_id)
+    
+    if from_idx is None or to_idx is None:
+        return None
+    
+    if not cache.track_points:
+        return None
+    
+    total_points = len(cache.track_points)
+    
+    if direction == "OuterLoop":
+        # 外回り: track_points のインデックス増加方向に進む
+        if from_idx <= to_idx:
+            coords = cache.track_points[from_idx:to_idx + 1]
+        else:
+            # 0をまたぐ場合（例: 品川 → 大崎 → 五反田）
+            coords = cache.track_points[from_idx:] + cache.track_points[:to_idx + 1]
+    else:
+        # 内回り: track_points のインデックス減少方向に進む
+        # → 座標を逆順で取得する
+        if from_idx >= to_idx:
+            coords = cache.track_points[to_idx:from_idx + 1]
+            coords = coords[::-1]  # 逆順にして from → to の順にする
+        else:
+            # 0をまたぐ場合（例: 五反田 → 大崎 → 品川）
+            coords = cache.track_points[to_idx:] + cache.track_points[:from_idx + 1]
+            coords = coords[::-1]
+    
+    # tuple を list に変換
+    return [[c[0], c[1]] for c in coords]
+
+
+def estimate_segment_progress(
+    segment_coords: list[list[float]],  # [[lon, lat], [lon, lat], ...]
+    target_lat: float,
+    target_lon: float,
+    max_distance_m: float = 200.0
+) -> float | None:
+    """
+    GTFS-RT座標から区間内の進捗率を推定する。
+    
+    Args:
+        segment_coords: 区間の座標列 [[lon, lat], ...]（from → to の順）
+        target_lat: GTFS-RTの緯度
+        target_lon: GTFS-RTの経度
+        max_distance_m: 線路からの最大許容距離（メートル）
+    
+    Returns:
+        進捗率 (0.0〜1.0) または None（計算不能・異常時）
+    """
+    # 1. 入力検証
+    if not segment_coords or len(segment_coords) < 2:
+        return None
+    
+    # 2. 累積距離の計算
+    cumulative_distances = [0.0]
+    for i in range(1, len(segment_coords)):
+        prev = segment_coords[i - 1]
+        curr = segment_coords[i]
+        dist = haversine_distance(prev[1], prev[0], curr[1], curr[0])
+        cumulative_distances.append(cumulative_distances[-1] + dist)
+    
+    total_length = cumulative_distances[-1]
+    if total_length < 1.0:  # 1m未満はゼロ除算防止
+        return None
+    
+    # 3. 最近接点の探索
+    min_dist = float('inf')
+    best_segment_idx = 0
+    best_t = 0.0
+    best_nearest_lon = segment_coords[0][0]
+    best_nearest_lat = segment_coords[0][1]
+    
+    for i in range(len(segment_coords) - 1):
+        ax, ay = segment_coords[i]
+        bx, by = segment_coords[i + 1]
+        
+        dist, nearest_lon, nearest_lat, t = point_to_segment_distance(
+            target_lon, target_lat, ax, ay, bx, by
+        )
+        
+        if dist < min_dist:
+            min_dist = dist
+            best_segment_idx = i
+            best_t = t
+            best_nearest_lon = nearest_lon
+            best_nearest_lat = nearest_lat
+    
+    # 4. 距離チェック
+    if min_dist > max_distance_m:
+        return None
+    
+    # 5. 進捗率の計算
+    # セグメント始点から最近接点までの距離を計算
+    segment_start_dist = cumulative_distances[best_segment_idx]
+    segment_length = (cumulative_distances[best_segment_idx + 1] - 
+                     cumulative_distances[best_segment_idx])
+    
+    progress_distance = segment_start_dist + best_t * segment_length
+    progress = progress_distance / total_length
+    
+    # 6. クランプして返す
+    return max(0.0, min(1.0, progress))
+
+
+# ============================================================================
+# Phase 1: Main Blending Logic
+# ============================================================================
+
+def train_state_to_position_with_override(
+    state: "TrainSectionState",
+    cache: "DataCache",
+    override_progress: float | None = None,
+    data_quality: str = "timetable_only"
+) -> Optional[TrainPosition]:
+    """
+    TrainSectionState を TrainPosition（座標）に変換する。
+    override_progress が指定された場合、state.progress の代わりにその値を使用する。
+    """
+    train = state.train
+
+    train_id = (
+        f"{train.base_id}.{train.service_type}"
+        if train.service_type and train.service_type != "Unknown"
+        else train.base_id
+    )
+
+    # 停車中
+    if state.is_stopped:
+        station_id = state.stopped_at_station_id or state.from_station_id
+        coord = _get_station_coord(station_id, cache)
+        if coord is None:
+            return None
+
+        lon, lat = coord
+
+        return TrainPosition(
+            train_id=train_id,
+            base_id=train.base_id,
+            number=train.number,
+            service_type=train.service_type,
+            line_id=train.line_id,
+            direction=train.direction,
+            is_stopped=True,
+            station_id=station_id,
+            from_station_id=None,
+            to_station_id=None,
+            progress=0.0,
+            lon=lon,
+            lat=lat,
+            current_time_sec=state.current_time_sec,
+            is_scheduled=True,
+            delay_seconds=0,
+            departure_time=state.segment_end_sec,
+            data_quality=data_quality,
+        )
+
+    # 走行中
+    from_id = state.from_station_id
+    to_id = state.to_station_id
+    
+    progress = override_progress if override_progress is not None else state.progress
+
+    coords = _interpolate_coords(from_id, to_id, progress, train.direction, cache)
+    if coords is None:
+        return None
+
+    lon, lat = coords
+
+    return TrainPosition(
+        train_id=train_id,
+        base_id=train.base_id,
+        number=train.number,
+        service_type=train.service_type,
+        line_id=train.line_id,
+        direction=train.direction,
+        is_stopped=False,
+        station_id=None,
+        from_station_id=from_id,
+        to_station_id=to_id,
+        progress=progress,
+        lon=lon,
+        lat=lat,
+        current_time_sec=state.current_time_sec,
+        is_scheduled=True,
+        delay_seconds=0,
+        departure_time=None,
+        data_quality=data_quality,
+    )
+
+
+def get_blended_train_positions(
+    current_time: datetime,
+    cache: "DataCache",
+    gtfs_data: dict[str, "YamanoteTrainPosition"] | None = None
+) -> list[TrainPosition]:
+    """
+    時刻表ベースの位置にGTFS-RTの補正を適用した列車位置を返す。
+    
+    Args:
+        current_time: 現在時刻
+        cache: データキャッシュ
+        gtfs_data: GTFS-RTデータ（train_numberをキーとする辞書）
+    
+    Returns:
+        補正済みの列車位置リスト
+    """
+    from train_state import get_yamanote_trains_at, blend_progress
+    
+    # 1. 時刻表から現在の列車状態を取得（既存ロジック）
+    states = get_yamanote_trains_at(current_time, cache)
+    
+    results = []
+    blend_stats = {"good": 0, "stale": 0, "rejected": 0, "timetable_only": 0, "error": 0}
+    
+    for state in states:
+        # 2. マッチするGTFS-RTデータを探す
+        gtfs_position = None
+        if gtfs_data and state.train.number in gtfs_data:
+            gtfs_position = gtfs_data[state.train.number]
+        
+        # 3. 走行中の場合のみブレンド処理を試みる
+        blended_progress = state.progress
+        data_quality = "timetable_only"
+        
+        if not state.is_stopped and gtfs_position is not None:
+            try:
+                # 3a. 区間の座標列を取得（方向を考慮）
+                segment_coords = get_segment_coords(
+                    state.from_station_id,
+                    state.to_station_id,
+                    state.train.direction,
+                    cache
+                )
+                
+                if segment_coords and len(segment_coords) >= 2:
+                    # 3b. GTFS-RT座標から進捗率を推定
+                    rt_progress = estimate_segment_progress(
+                        segment_coords,
+                        gtfs_position.latitude,
+                        gtfs_position.longitude
+                    )
+                    
+                    if rt_progress is not None:
+                        # 3c. staleness を計算
+                        staleness_sec = current_time.timestamp() - gtfs_position.timestamp
+                        
+                        # 3d. ブレンド
+                        blended_progress, data_quality = blend_progress(
+                            state.progress,
+                            rt_progress,
+                            staleness_sec
+                        )
+            except Exception as e:
+                # エラー時は時刻表の値をそのまま使用
+                logger.warning(f"Blend failed for {state.train.number}: {e}")
+                blended_progress = state.progress
+                data_quality = "error"
+        
+        # 4. 進捗率を座標に変換
+        position = train_state_to_position_with_override(
+            state, 
+            cache, 
+            override_progress=blended_progress,
+            data_quality=data_quality
+        )
+        
+        if position:
+            blend_stats[data_quality] = blend_stats.get(data_quality, 0) + 1
+            results.append(position)
+    
+    logger.info(
+        f"Blended {len(results)} trains: good={blend_stats['good']}, "
+        f"stale={blend_stats['stale']}, rejected={blend_stats['rejected']}, "
+        f"timetable_only={blend_stats['timetable_only']}, error={blend_stats['error']}"
+    )
+    
+    return results
+
