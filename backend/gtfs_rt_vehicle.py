@@ -72,36 +72,35 @@ def get_direction(trip_id: str) -> str:
 
 def get_train_number(trip_id: str) -> str:
     """
-    Trip ID から列車番号を抽出する（4桁プレフィックススキップ + ゼロ埋め除去）
+    Trip ID から列車番号を抽出する（正規化対応版）
     
-    山手線のtrip_idは「4桁プレフィックス + 列車番号」の形式。
-    例: "4201301G" → "301G", "42020906G" → "906G"
+    プレフィックスの長さに依存せず、末尾の「3〜4桁の数字 + 英字」パターンを抽出する。
+    これにより "4201103G" から "1103G" を、"4200906G" から "906G" を正しく取得できる。
     
     Args:
-        trip_id: GTFS Trip ID (例: "4201301G", "42020906G")
+        trip_id: GTFS Trip ID (例: "4201301G", "42001103G")
     
     Returns:
-        抽出・正規化された列車番号 (例: "301G", "906G")
+        正規化された列車番号 (例: "301G", "1103G")
     """
-    # 4桁のプレフィックスをスキップ
-    if len(trip_id) <= 4:
-        return trip_id
+    # 末尾にある "3〜4桁の数字 + 英字1文字" を検索
+    # (\d{3,4}) : 3桁または4桁の数字（山手線の列車番号は3〜4桁）
+    # ([A-Z])   : 英字1文字 (G)
+    # $         : 末尾
+    match = re.search(r'(\d{3,4})([A-Z])$', trip_id)
     
-    suffix = trip_id[4:]  # 例: "0906G" or "301G"
-    
-    # 末尾の "数字 + 英字" パターンをマッチ
-    match = re.match(r'^(\d+)([A-Z])$', suffix)
     if match:
         number_part = match.group(1)
-        letter = match.group(2)
+        suffix = match.group(2)
         
-        # 数値化して先頭の0を削除 (例: "0906" -> 906 -> "906")
+        # 数値化して先頭の0を削除（例: "0906" -> 906 -> "906"）
         normalized_number = str(int(number_part))
         
-        return f"{normalized_number}{letter}"
+        return f"{normalized_number}{suffix}"
     
-    # マッチしない場合はそのまま返す
-    return suffix
+    # マッチしない場合は、安全策として元の値をそのまま返す
+    # (無理にスライスすると情報が壊れる可能性があるため)
+    return trip_id
 
 
 async def fetch_yamanote_positions(api_key: str) -> list[YamanoteTrainPosition]:

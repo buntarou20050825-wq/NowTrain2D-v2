@@ -362,17 +362,17 @@ async def get_yamanote_positions_v3():
             gtfs_data
         )
         
-        # ★ デバッグ用: マッチングしなかったGTFSキーのサンプルを出力
+        # ★ デバッグ: マッチング状況の詳細確認
         if gtfs_data:
-            gtfs_keys = set(gtfs_data.keys())
-            # マッチ成功したキー（timetable_only 以外）
+            gtfs_samples = sorted(list(gtfs_data.keys()))[:10]
+            # マッチ成功したキー
             matched_keys = {p.number for p in positions if p.data_quality != "timetable_only"}
-            
             # マッチしなかったキー
-            unmatched_gtfs = list(gtfs_keys - matched_keys)
+            unmatched_gtfs = list(set(gtfs_data.keys()) - matched_keys)
             
+            logger.info(f"GTFS-RT Keys (Sample): {gtfs_samples}")
             if unmatched_gtfs:
-                logger.warning(f"Unmatched GTFS keys (sample 5): {unmatched_gtfs[:5]}")
+                logger.warning(f"Unmatched GTFS keys: {unmatched_gtfs[:10]}")
             else:
                 logger.info("All GTFS data matched successfully!")
         

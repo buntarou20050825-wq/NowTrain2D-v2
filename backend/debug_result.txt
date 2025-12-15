@@ -1,0 +1,64 @@
+============================================================
+Debug: Train ID Comparison
+Time: 2025-12-12T13:47:07.373104+09:00
+============================================================
+
+[Cache] Loaded 30340 segments
+
+[Timetable] 25 trains active
+[Timetable] Sample: ['1204G', '1217G', '1219G', '1229G', '1266G', '1268G', '1300G', '1301G', '1302G', '1303G']
+
+[GTFS-RT] 26 positions fetched
+
+[GTFS-RT] Raw data sample (first 10):
+  trip_id=4201215G -> train_number=215G
+  trip_id=4201217G -> train_number=217G
+  trip_id=4201219G -> train_number=219G
+  trip_id=4201229G -> train_number=229G
+  trip_id=4201301G -> train_number=301G
+  trip_id=4201303G -> train_number=303G
+  trip_id=4201305G -> train_number=305G
+  trip_id=4201307G -> train_number=307G
+  trip_id=4201311G -> train_number=311G
+  trip_id=4201313G -> train_number=313G
+
+============================================================
+COMPARISON RESULTS
+============================================================
+Matched: 0
+Only in Timetable: 25
+Only in GTFS-RT: 26
+
+[Matched sample]: []
+[Only Timetable sample]: ['1204G', '1217G', '1219G', '1229G', '1266G', '1268G', '1300G', '1301G', '1302G', '1303G']
+[Only GTFS-RT sample]: ['202G', '204G', '212G', '215G', '217G', '219G', '229G', '266G', '268G', '300G']
+
+============================================================
+UNMATCHED GTFS DETAIL (All)
+============================================================
+  202G: trip_id=4211202G
+  204G: trip_id=4211204G
+  212G: trip_id=4211212G
+  215G: trip_id=4201215G
+  217G: trip_id=4201217G
+  219G: trip_id=4201219G
+  229G: trip_id=4201229G
+  266G: trip_id=4211266G
+  268G: trip_id=4211268G
+  300G: trip_id=4211300G
+  301G: trip_id=4201301G
+  303G: trip_id=4201303G
+  305G: trip_id=4201305G
+  306G: trip_id=4211306G
+  307G: trip_id=4201307G
+  308G: trip_id=4211308G
+  310G: trip_id=4211310G
+  311G: trip_id=4201311G
+  313G: trip_id=4201313G
+  316G: trip_id=4211316G
+  323G: trip_id=4201323G
+  331G: trip_id=4201331G
+  333G: trip_id=4201333G
+  362G: trip_id=4211362G
+  364G: trip_id=4211364G
+  374G: trip_id=4211374G
