@@ -54,6 +54,15 @@ function App() {
   const [trackedTrain, setTrackedTrain] = useState(null);
   const trackedTrainRef = useRef(null);
 
+  // ========== 電車ID検索機能 ==========
+  const [searchQuery, setSearchQuery] = useState("");
+  const searchQueryRef = useRef("");
+
+  // ========== 表示モード切り替え ==========
+  // 'all' = 全て表示, 'timetable' = 時刻表のみ, 'gtfs' = GTFS-RTのみ, 'blend' = ブレンドのみ
+  const [displayMode, setDisplayMode] = useState("all");
+  const displayModeRef = useRef("all");
+
   // ========== GTFS-RT更新遅延計測用 ==========
   const trainStatesRef = useRef({});  // { trainNumber: { stopSeq, lastUpdate } }
 
@@ -61,6 +70,16 @@ function App() {
   useEffect(() => {
     trackedTrainRef.current = trackedTrain;
   }, [trackedTrain]);
+
+  // searchQuery同期
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
+
+  // displayMode同期
+  useEffect(() => {
+    displayModeRef.current = displayMode;
+  }, [displayMode]);
 
   useEffect(() => {
     if (mapRef.current) return;
@@ -110,36 +129,83 @@ function App() {
         const props = feature.properties;
         const coords = feature.geometry.coordinates;
 
-        // 時刻をフォーマット
-        const formatTime = (unix) => {
-          if (!unix) return 'N/A';
-          const d = new Date(unix * 1000);
-          return d.toLocaleTimeString('ja-JP');
+        // GTFS Status をテキストに変換
+        const getStatusText = (status) => {
+          switch (status) {
+            case 1: return '停車中';
+            case 2: return '走行中';
+            default: return status ? `不明(${status})` : 'N/A';
+          }
         };
 
-        // 駅名を取得
-        const getStationName = (index) => {
-          if (index < 0 || index >= YAMANOTE_STATIONS.length) return '不明';
-          return YAMANOTE_STATIONS[index].id;
+        // 駅IDから駅名を抽出（簡易）
+        const getShortStationName = (stationId) => {
+          if (!stationId) return 'N/A';
+          return stationId.split('.').pop() || stationId;
         };
-
-        const currentStationIdx = props.currentStationIndex;
-        const nextStationIdx = props.nextStationIndex;
 
         const html = `
-          <div style="font-family: sans-serif; font-size: 12px; min-width: 200px;">
+          <div style="font-family: sans-serif; font-size: 12px; min-width: 220px;">
             <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px;">
-              ${props.trainNumber} (${props.direction === 'OuterLoop' ? '外回り' : '内回り'})
+              🚃 ${props.trainNumber} (${props.direction === 'OuterLoop' ? '外回り' : '内回り'})
             </h3>
             <table style="width: 100%; border-collapse: collapse;">
-              <tr><td><b>状態:</b></td><td>${props.source} ${props.interpolated ? '(補間中)' : ''}</td></tr>
-              <tr><td><b>現在駅:</b></td><td>${getStationName(currentStationIdx)} (seq: ${props.stopSequence})</td></tr>
-              <tr><td><b>次の駅:</b></td><td>${getStationName(nextStationIdx)}</td></tr>
-              <tr><td><b>発車時刻:</b></td><td>${formatTime(props.departureTime)}</td></tr>
-              <tr><td><b>次駅到着:</b></td><td>${formatTime(props.nextArrivalTime)}</td></tr>
-              <tr><td><b>GTFS-RT更新:</b></td><td>${formatTime(props.timestamp)}</td></tr>
-              <tr><td><b>座標:</b></td><td>${coords[1].toFixed(4)}, ${coords[0].toFixed(4)}</td></tr>
-              <tr><td><b>GTFS座標:</b></td><td>${props.gtfsLat?.toFixed(4)}, ${props.gtfsLon?.toFixed(4)}</td></tr>
+              <tr><td><b>品質:</b></td><td>${props.dataQuality || 'N/A'}</td></tr>
+              <tr><td><b>状態:</b></td><td>${props.isStopped === 'true' || props.isStopped === true ? '停車中' : '走行中'}</td></tr>
+              <tr><td><b>停車駅:</b></td><td>${getShortStationName(props.stationId)}</td></tr>
+              <tr><td><b>区間:</b></td><td>${getShortStationName(props.fromStation)} → ${getShortStationName(props.toStation)}</td></tr>
+              <tr><td><b>進捗:</b></td><td>${(parseFloat(props.progress) * 100).toFixed(1)}%</td></tr>
+              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>GTFS-RT情報</b></td></tr>
+              <tr><td><b>Stop Seq:</b></td><td>${props.stopSequence || 'N/A'}</td></tr>
+              <tr><td><b>Status:</b></td><td>${getStatusText(props.gtfsStatus)}</td></tr>
+              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>座標比較</b></td></tr>
+              <tr><td><b>ブレンド:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
+              <tr><td><b>時刻表:</b></td><td>${props.timetableLat ? parseFloat(props.timetableLat).toFixed(5) + ', ' + parseFloat(props.timetableLon).toFixed(5) : 'N/A'}</td></tr>
+              <tr><td><b>GTFS-RT:</b></td><td>${props.gtfsLat ? parseFloat(props.gtfsLat).toFixed(5) + ', ' + parseFloat(props.gtfsLon).toFixed(5) : 'N/A'}</td></tr>
+            </table>
+          </div>
+        `;
+
+        popup.setLngLat(coords).setHTML(html).addTo(map);
+      });
+
+      // ★ 時刻表マーカー（Ghost）クリック時のポップアップ
+      map.on('click', 'yamanote-trains-timetable-circle', (e) => {
+        const feature = e.features[0];
+        const props = feature.properties;
+        const coords = feature.geometry.coordinates;
+
+        const html = `
+          <div style="font-family: sans-serif; font-size: 12px; min-width: 180px;">
+            <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px; color: #888;">
+              📍 ${props.trainNumber} - 時刻表位置
+            </h3>
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr><td><b>方向:</b></td><td>${props.direction === 'OuterLoop' ? '外回り' : '内回り'}</td></tr>
+              <tr><td><b>タイプ:</b></td><td>時刻表ベース（予定位置）</td></tr>
+              <tr><td><b>座標:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
+            </table>
+          </div>
+        `;
+
+        popup.setLngLat(coords).setHTML(html).addTo(map);
+      });
+
+      // ★ GTFS-RTマーカー（実測）クリック時のポップアップ
+      map.on('click', 'yamanote-trains-gtfs-circle', (e) => {
+        const feature = e.features[0];
+        const props = feature.properties;
+        const coords = feature.geometry.coordinates;
+
+        const html = `
+          <div style="font-family: sans-serif; font-size: 12px; min-width: 180px;">
+            <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #FF5722; padding-bottom: 4px; color: #FF5722;">
+              📡 ${props.trainNumber} - GTFS-RT位置
+            </h3>
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr><td><b>方向:</b></td><td>${props.direction === 'OuterLoop' ? '外回り' : '内回り'}</td></tr>
+              <tr><td><b>タイプ:</b></td><td>GTFS-RT実測位置</td></tr>
+              <tr><td><b>座標:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
             </table>
           </div>
         `;
@@ -152,6 +218,22 @@ function App() {
         map.getCanvas().style.cursor = 'pointer';
       });
       map.on('mouseleave', 'yamanote-trains-circle', () => {
+        map.getCanvas().style.cursor = '';
+      });
+
+      // ★ 時刻表マーカーのカーソル
+      map.on('mouseenter', 'yamanote-trains-timetable-circle', () => {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', 'yamanote-trains-timetable-circle', () => {
+        map.getCanvas().style.cursor = '';
+      });
+
+      // ★ GTFS-RTマーカーのカーソル
+      map.on('mouseenter', 'yamanote-trains-gtfs-circle', () => {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', 'yamanote-trains-gtfs-circle', () => {
         map.getCanvas().style.cursor = '';
       });
 
@@ -343,6 +425,66 @@ function App() {
         });
       }
 
+      // ★ 比較表示用: 時刻表位置マーカー（Ghost - 半透明）
+      if (!map.getSource("yamanote-trains-timetable")) {
+        map.addSource("yamanote-trains-timetable", {
+          type: "geojson",
+          data: {
+            type: "FeatureCollection",
+            features: [],
+          },
+        });
+
+        map.addLayer({
+          id: "yamanote-trains-timetable-circle",
+          type: "circle",
+          source: "yamanote-trains-timetable",
+          paint: {
+            "circle-radius": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              10, 3,
+              14, 6,
+            ],
+            "circle-stroke-width": 1,
+            "circle-stroke-color": "#888888",
+            "circle-color": "#CCCCCC",
+            "circle-opacity": 0.4,
+          },
+        });
+      }
+
+      // ★ 比較表示用: GTFS-RT実測位置マーカー（強調表示）
+      if (!map.getSource("yamanote-trains-gtfs")) {
+        map.addSource("yamanote-trains-gtfs", {
+          type: "geojson",
+          data: {
+            type: "FeatureCollection",
+            features: [],
+          },
+        });
+
+        map.addLayer({
+          id: "yamanote-trains-gtfs-circle",
+          type: "circle",
+          source: "yamanote-trains-gtfs",
+          paint: {
+            "circle-radius": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              10, 4,
+              14, 7,
+            ],
+            "circle-stroke-width": 3,
+            "circle-stroke-color": "#FF5722",  // オレンジ系の強調色
+            "circle-color": "#FFFFFF",
+            "circle-opacity": 0.9,
+          },
+        });
+      }
+
       // MS2: API の動作確認
       const apiData = await fetchLinesFromApi();
       console.log("API /api/lines result:", apiData);
@@ -391,16 +533,58 @@ function App() {
       if (!src) return;
 
       try {
-        // v3 API（出発時刻付き）を使用
-        const res = await fetch("/api/trains/yamanote/positions/v3");
+        // ★ MS4: v4 API（TripUpdate-only）を使用
+        const res = await fetch("/api/trains/yamanote/positions/v4");
         if (!res.ok) return;
         const json = await res.json();
-        const gtfsTrains = json.trains || [];
 
-        // ★ デバッグ: APIレスポンスの生データ確認
+        // v4 では positions 配列を使用
+        const v4Positions = json.positions || [];
+
+        // ★ MS4: v4レスポンスを既存のフラット構造にマッピング
+        // 既存UIとの互換性を維持するため、既存プロパティ名に変換
+        const gtfsTrains = v4Positions
+          .filter(p => p.location && p.location.latitude != null && p.location.longitude != null)
+          .map(p => {
+            // dataQuality の擬似生成（既存の色分け互換）
+            let dataQuality = 'good';
+            if (p.status === 'unknown') {
+              dataQuality = 'stale';
+            } else if (p.status === 'invalid') {
+              dataQuality = 'rejected';
+            }
+
+            return {
+              // 既存プロパティ（フラット）
+              trainNumber: p.train_number || '',
+              tripId: p.trip_id,
+              direction: p.direction,
+              latitude: p.location.latitude,
+              longitude: p.location.longitude,
+              stopSequence: p.segment?.prev_seq || null,
+              departureTime: p.times?.t0_departure || null,
+              nextArrivalTime: p.times?.t1_arrival || null,
+              isStopped: p.status === 'stopped',
+              progress: p.progress,
+              dataQuality: dataQuality,
+              source: 'v4-tripupdate',
+              // 追加情報
+              status: p.status,
+              fromStation: p.segment?.prev_station_id || null,
+              toStation: p.segment?.next_station_id || null,
+              stationId: p.status === 'stopped' ? p.segment?.prev_station_id : null,
+              // 比較座標（v4では同じ座標を使う）
+              timetableLatitude: null,
+              timetableLongitude: null,
+              gtfsLatitude: null,
+              gtfsLongitude: null,
+            };
+          });
+
+        // ★ デバッグ: v4 APIレスポンスの生データ確認
         if (gtfsTrains.length > 0) {
           const sample = gtfsTrains[0];
-          console.log('[debug] API response sample:', {
+          console.log('[debug] v4 API response sample:', {
             trainNumber: sample.trainNumber,
             direction: sample.direction,
             stopSequence: sample.stopSequence,
@@ -408,7 +592,8 @@ function App() {
             longitude: sample.longitude,
             departureTime: sample.departureTime,
             nextArrivalTime: sample.nextArrivalTime,
-            timestamp: sample.timestamp,  // これがundefinedかも
+            dataQuality: sample.dataQuality,
+            source: sample.source,
           });
         }
 
@@ -456,7 +641,7 @@ function App() {
           };
         }
 
-        // v3 API は既にブレンド済みの座標を返すのでそのまま使用
+        // v4 API は既にブレンド済みの座標を返すのでそのまま使用
         const positions = gtfsTrains.map(train => {
           // 追跡中の列車を詳細ログ
           if (trackedTrainRef.current && train.trainNumber === trackedTrainRef.current) {
@@ -492,23 +677,93 @@ function App() {
             isStopped: train.isStopped,
             stationId: train.stationId,
             dataQuality: train.dataQuality,
+            // GTFS-RT情報
+            stopSequence: train.stopSequence,
+            gtfsStatus: train.status,
+            // 比較座標（v4ではない）
+            timetableLat: train.timetableLatitude,
+            timetableLon: train.timetableLongitude,
+            gtfsLat: train.gtfsLatitude,
+            gtfsLon: train.gtfsLongitude,
           };
         });
 
-        // GeoJSON に変換
-        const features = positions.map(p => ({
+        // GeoJSON に変換（検索フィルタ適用）
+        const query = searchQueryRef.current.trim().toLowerCase();
+        const filteredPositions = query
+          ? positions.filter(p => p.trainNumber.toLowerCase().includes(query))
+          : positions;
+
+        // 表示モードに応じてブレンドマーカーを表示/非表示
+        const mode = displayModeRef.current;
+        const showBlend = mode === 'all' || mode === 'blend';
+        const showTimetable = mode === 'all' || mode === 'timetable';
+        const showGtfs = mode === 'all' || mode === 'gtfs';
+
+        const features = showBlend ? filteredPositions.map(p => ({
           type: "Feature",
           geometry: {
             type: "Point",
             coordinates: [p.lon, p.lat],
           },
           properties: { ...p },
-        }));
+        })) : [];
 
         src.setData({
           type: "FeatureCollection",
           features,
         });
+
+        // ★ 比較表示用マーカーのデータを設定（検索フィルタ + 表示モード適用）
+        const filteredGtfsTrains = query
+          ? gtfsTrains.filter(t => t.trainNumber.toLowerCase().includes(query))
+          : gtfsTrains;
+
+        // 時刻表位置（Ghost）
+        const timetableSrc = map.getSource("yamanote-trains-timetable");
+        if (timetableSrc) {
+          const timetableFeatures = showTimetable ? filteredGtfsTrains
+            .filter(t => t.timetableLatitude && t.timetableLongitude)
+            .map(t => ({
+              type: "Feature",
+              geometry: {
+                type: "Point",
+                coordinates: [t.timetableLongitude, t.timetableLatitude],
+              },
+              properties: {
+                trainNumber: t.trainNumber,
+                direction: t.direction,
+                type: "timetable",
+              },
+            })) : [];
+          timetableSrc.setData({
+            type: "FeatureCollection",
+            features: timetableFeatures,
+          });
+        }
+
+        // GTFS-RT実測位置（強調）
+        const gtfsSrc = map.getSource("yamanote-trains-gtfs");
+        if (gtfsSrc) {
+          const gtfsFeatures = showGtfs ? filteredGtfsTrains
+            .filter(t => t.gtfsLatitude && t.gtfsLongitude)
+            .map(t => ({
+              type: "Feature",
+              geometry: {
+                type: "Point",
+                coordinates: [t.gtfsLongitude, t.gtfsLatitude],
+              },
+              properties: {
+                trainNumber: t.trainNumber,
+                direction: t.direction,
+                type: "gtfs",
+              },
+            })) : [];
+          gtfsSrc.setData({
+            type: "FeatureCollection",
+            features: gtfsFeatures,
+          });
+        }
 
         // dataQuality 別の集計
         const qualityCounts = {};
@@ -562,15 +817,81 @@ function App() {
         borderRadius: '5px',
         boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
       }}>
-        <input
-          type="text"
-          placeholder="列車番号 (例: 005G)"
-          onChange={(e) => setTrackedTrain(e.target.value.toUpperCase() || null)}
-          style={{ width: '120px', marginRight: '5px' }}
-        />
-        <span style={{ fontSize: '12px', color: '#666' }}>
-          {trackedTrain ? `追跡中: ${trackedTrain}` : '未選択'}
-        </span>
+        {/* 検索フィルタ */}
+        <div style={{ marginBottom: '8px' }}>
+          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>🔍 検索:</span>
+          <input
+            type="text"
+            placeholder="列車番号で絞り込み"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value.toUpperCase())}
+            style={{
+              width: '140px',
+              marginRight: '10px',
+              padding: '4px 8px',
+              border: '1px solid #ccc',
+              borderRadius: '4px',
+            }}
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery("")}
+              style={{
+                padding: '4px 8px',
+                cursor: 'pointer',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                backgroundColor: '#f5f5f5',
+              }}
+            >
+              クリア
+            </button>
+          )}
+          {searchQuery && (
+            <span style={{ marginLeft: '10px', fontSize: '12px', color: '#666' }}>
+              フィルタ中: "{searchQuery}"
+            </span>
+          )}
+        </div>
+        {/* 追跡機能 */}
+        <div style={{ marginBottom: '8px' }}>
+          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>📍 追跡:</span>
+          <input
+            type="text"
+            placeholder="列車番号 (例: 005G)"
+            onChange={(e) => setTrackedTrain(e.target.value.toUpperCase() || null)}
+            style={{ width: '120px', marginRight: '5px' }}
+          />
+          <span style={{ fontSize: '12px', color: '#666' }}>
+            {trackedTrain ? `追跡中: ${trackedTrain}` : '未選択'}
+          </span>
+        </div>
+        {/* 表示モード切り替え */}
+        <div>
+          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>👁 表示:</span>
+          {[
+            { mode: 'all', label: '全て' },
+            { mode: 'blend', label: 'ブレンド' },
+            { mode: 'timetable', label: '時刻表のみ' },
+            { mode: 'gtfs', label: 'GTFS-RTのみ' },
+          ].map(({ mode, label }) => (
+            <button
+              key={mode}
+              onClick={() => setDisplayMode(mode)}
+              style={{
+                padding: '4px 8px',
+                marginRight: '5px',
+                cursor: 'pointer',
+                border: displayMode === mode ? '2px solid #2196F3' : '1px solid #ccc',
+                borderRadius: '4px',
+                backgroundColor: displayMode === mode ? '#E3F2FD' : '#f5f5f5',
+                fontWeight: displayMode === mode ? 'bold' : 'normal',
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
     </div>

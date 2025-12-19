@@ -1,0 +1,37 @@
+=== MS2 Test Results ===
+Total: 26
+Running: 25
+Stopped: 0
+Unknown: 1
+Invalid: 0
+
+Progress in range: Yes
+No 31->1 loop: Yes
+
+=== All Results ===
+1201G: status=running, progress=0.1111111111111111, seg=26->27
+1203G: status=unknown, progress=None, seg=1->31
+1211G: status=running, progress=0.16666666666666666, seg=29->30
+1213G: status=running, progress=0.16666666666666666, seg=23->24
+1215G: status=running, progress=0.6190476190476191, seg=19->20
+1217G: status=running, progress=0.1111111111111111, seg=19->20
+1219G: status=running, progress=0.6190476190476191, seg=12->13
+1229G: status=running, progress=0.6190476190476191, seg=15->16
+1305G: status=running, progress=0.3939393939393939, seg=7->8
+1307G: status=running, progress=0.6190476190476191, seg=4->5
+1323G: status=running, progress=0.16666666666666666, seg=3->4
+1331G: status=running, progress=0.16666666666666666, seg=10->11
+1333G: status=running, progress=0.1111111111111111, seg=4->5
+1200G: status=running, progress=0.3333333333333333, seg=30->31
+1202G: status=running, progress=0.16666666666666666, seg=21->22
+1204G: status=running, progress=0.16666666666666666, seg=13->14
+1208G: status=running, progress=0.6190476190476191, seg=25->26
+1210G: status=running, progress=0.6190476190476191, seg=24->25
+1212G: status=running, progress=0.6190476190476191, seg=20->21
+1264G: status=running, progress=0.6190476190476191, seg=26->27
+1266G: status=running, progress=0.16666666666666666, seg=18->19
+1268G: status=running, progress=0.16666666666666666, seg=16->17
+1306G: status=running, progress=0.6190476190476191, seg=4->5
+1316G: status=running, progress=0.16666666666666666, seg=10->11
+1362G: status=running, progress=0.16666666666666666, seg=7->8
+1374G: status=running, progress=0.16666666666666666, seg=2->3

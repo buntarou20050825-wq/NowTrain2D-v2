@@ -8,7 +8,9 @@ from dotenv import load_dotenv
 import os
 import logging
 from typing import Any, Dict, List, Optional
+from dataclasses import asdict
 
+import httpx
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -42,7 +44,17 @@ async def startup_event():
         len(data_cache.railways),
         len(data_cache.stations),
     )
-    # TODO (MS6): FastAPI 0.109+ では lifespan を使う書き方も検討
+    # MS1-TripUpdate: httpx.AsyncClient を作成
+    app.state.http_client = httpx.AsyncClient()
+    logger.info("httpx.AsyncClient initialized")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # MS1-TripUpdate: httpx.AsyncClient をクローズ
+    if hasattr(app.state, "http_client"):
+        await app.state.http_client.aclose()
+        logger.info("httpx.AsyncClient closed")
 
 
 # CORS 設定
@@ -393,9 +405,14 @@ async def get_yamanote_positions_v3():
                     "isStopped": pos.is_stopped,
                     "stationId": pos.station_id,
                     "dataQuality": pos.data_quality,
-                    # ★ 新規追加: フロントエンドが期待しているフィールド
+                    # GTFS-RT 生情報
                     "stopSequence": pos.gtfs_stop_sequence,
                     "gtfsStatus": pos.gtfs_status,
+                    # ★ 比較表示用座標
+                    "timetableLatitude": pos.timetable_lat,
+                    "timetableLongitude": pos.timetable_lon,
+                    "gtfsLatitude": pos.gtfs_lat,
+                    "gtfsLongitude": pos.gtfs_lon,
                 }
                 for pos in positions
             ]
@@ -405,3 +422,263 @@ async def get_yamanote_positions_v3():
         logger.error(f"Error in v3 endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ============================================================================
+# MS1-TripUpdate: Debug Endpoint
+# ============================================================================
+
+@app.get("/api/debug/trip_updates")
+async def debug_trip_updates():
+    """
+    MS1 TripUpdate デバッグ用エンドポイント。
+    TripUpdate の取得結果をサンプルとして返す。
+    """
+    from gtfs_rt_tripupdate import fetch_trip_updates
+    
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ODPT_API_KEY not set")
+    
+    try:
+        client = app.state.http_client
+        schedules = await fetch_trip_updates(client, api_key, data_cache)
+        
+        # サンプル3件を抽出
+        sample_keys = list(schedules.keys())[:3]
+        samples = []
+        
+        for trip_id in sample_keys:
+            schedule = schedules[trip_id]
+            
+            # schedules_by_seq を list形式に変換
+            stops_list = []
+            for seq in schedule.ordered_sequences:
+                stu = schedule.schedules_by_seq.get(seq)
+                if stu:
+                    stops_list.append({
+                        "stop_sequence": stu.stop_sequence,
+                        "station_id": stu.station_id,
+                        "arrival_time": stu.arrival_time,
+                        "departure_time": stu.departure_time,
+                        "resolved": stu.resolved,
+                        "raw_stop_id": stu.raw_stop_id,
+                    })
+            
+            samples.append({
+                "trip_id": schedule.trip_id,
+                "train_number": schedule.train_number,
+                "start_date": schedule.start_date,
+                "direction": schedule.direction,
+                "feed_timestamp": schedule.feed_timestamp,
+                "stop_count": len(schedule.ordered_sequences),
+                "stops": stops_list,
+            })
+        
+        # 統計情報
+        total_count = len(schedules)
+        resolved_count = 0
+        direction_counts = {"InnerLoop": 0, "OuterLoop": 0, "Unknown": 0}
+        
+        for schedule in schedules.values():
+            for stu in schedule.schedules_by_seq.values():
+                if stu.resolved:
+                    resolved_count += 1
+            
+            if schedule.direction in direction_counts:
+                direction_counts[schedule.direction] += 1
+            else:
+                direction_counts["Unknown"] += 1
+        
+        return {
+            "status": "success",
+            "total_trains": total_count,
+            "resolved_station_count": resolved_count,
+            "direction_counts": direction_counts,
+            "samples": samples,
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in debug_trip_updates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# MS3: TripUpdate-only v4 API
+# ============================================================================
+
+def _get_station_coord(station_id: str | None) -> tuple[float, float] | None:
+    """
+    駅IDから座標を取得する。
+    data_cache.station_positions は (lon, lat) 形式。
+    返却は (lat, lon) 形式に変換。
+    """
+    if not station_id:
+        return None
+    
+    coord = data_cache.station_positions.get(station_id)
+    if coord:
+        lon, lat = coord
+        return (lat, lon)
+    return None
+
+
+def _calculate_position(
+    status: str,
+    progress: float | None,
+    prev_station_id: str | None,
+    next_station_id: str | None,
+) -> tuple[float | None, float | None]:
+    """
+    列車の現在座標を計算する。
+    
+    Returns:
+        (latitude, longitude) のタプル。計算不能なら (None, None)。
+    """
+    # 1) stopped: 停車駅の座標
+    if status == "stopped":
+        # stopped時は prev_station_id == next_station_id
+        coord = _get_station_coord(prev_station_id)
+        if coord:
+            return coord
+        # フォールバック
+        coord = _get_station_coord(next_station_id)
+        if coord:
+            return coord
+        return (None, None)
+    
+    # 2) running: 駅間の線形補間
+    if status == "running":
+        if progress is None:
+            return (None, None)
+        
+        prev_coord = _get_station_coord(prev_station_id)
+        next_coord = _get_station_coord(next_station_id)
+        
+        if prev_coord is None or next_coord is None:
+            # どちらかの座標が取れない
+            if prev_coord:
+                return prev_coord
+            if next_coord:
+                return next_coord
+            return (None, None)
+        
+        # 線形補間
+        lat0, lon0 = prev_coord
+        lat1, lon1 = next_coord
+        
+        lat = lat0 + (lat1 - lat0) * progress
+        lon = lon0 + (lon1 - lon0) * progress
+        
+        return (lat, lon)
+    
+    # 3) unknown / invalid: 基本 null
+    return (None, None)
+
+
+@app.get("/api/trains/yamanote/positions/v4")
+async def get_yamanote_positions_v4():
+    """
+    MS3/MS5: TripUpdate-only v4 API エンドポイント。
+    
+    TripUpdate から列車位置を計算し、線路形状に沿った座標付きで返す。
+    """
+    from gtfs_rt_tripupdate import fetch_trip_updates
+    from train_position_v4 import compute_all_progress, calculate_coordinates
+    
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "source": "tripupdate_v4",
+            "status": "error",
+            "error": "ODPT_API_KEY not set",
+            "timestamp": int(datetime.now(JST).timestamp()),
+            "total_trains": 0,
+            "positions": [],
+        }
+    
+    try:
+        # 1. MS1: TripUpdate取得
+        client = app.state.http_client
+        schedules = await fetch_trip_updates(client, api_key, data_cache)
+        
+        if not schedules:
+            return {
+                "source": "tripupdate_v4",
+                "status": "no_data",
+                "timestamp": int(datetime.now(JST).timestamp()),
+                "total_trains": 0,
+                "positions": [],
+            }
+        
+        # 2. MS2: 進捗計算
+        results = compute_all_progress(schedules)
+        
+        # 3. レスポンス構築
+        positions = []
+        now_ts = None
+        
+        for r in results:
+            # invalid は除外（デバッグには残したい場合は別途）
+            if r.status == "invalid":
+                continue
+            
+            # MS5: 座標計算（線路形状追従）
+            coord = calculate_coordinates(r, data_cache)
+            lat = coord[0] if coord else None
+            lon = coord[1] if coord else None
+            
+            # now_ts を最初の列車から取得
+            if now_ts is None:
+                now_ts = r.now_ts
+            
+            positions.append({
+                "trip_id": r.trip_id,
+                "train_number": r.train_number,
+                "direction": r.direction,
+                "status": r.status,
+                "progress": round(r.progress, 4) if r.progress is not None else None,
+                
+                "location": {
+                    "latitude": round(lat, 6) if lat is not None else None,
+                    "longitude": round(lon, 6) if lon is not None else None,
+                },
+                
+                "segment": {
+                    "prev_seq": r.prev_seq,
+                    "next_seq": r.next_seq,
+                    "prev_station_id": r.prev_station_id,
+                    "next_station_id": r.next_station_id,
+                },
+                
+                "times": {
+                    "now_ts": r.now_ts,
+                    "t0_departure": r.t0_departure,
+                    "t1_arrival": r.t1_arrival,
+                },
+                
+                "debug": {
+                    "feed_timestamp": r.feed_timestamp,
+                },
+            })
+        
+        # ソート: direction -> train_number
+        positions.sort(key=lambda p: (p["direction"] or "", p["train_number"] or ""))
+        
+        return {
+            "source": "tripupdate_v4",
+            "status": "success",
+            "timestamp": now_ts or int(datetime.now(JST).timestamp()),
+            "total_trains": len(positions),
+            "positions": positions,
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in v4 endpoint: {e}")
+        return {
+            "source": "tripupdate_v4",
+            "status": "error",
+            "error": str(e),
+            "timestamp": int(datetime.now(JST).timestamp()),
+            "total_trains": 0,
+            "positions": [],
+        }

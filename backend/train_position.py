@@ -56,6 +56,12 @@ class TrainPosition:
     # GTFS-RT 生情報
     gtfs_stop_sequence: Optional[int] = None
     gtfs_status: Optional[int] = None
+    
+    # 比較表示用座標（Phase 1 追加）
+    timetable_lat: Optional[float] = None  # 純粋な時刻表ベースの位置
+    timetable_lon: Optional[float] = None
+    gtfs_lat: Optional[float] = None       # 純粋なGTFS-RTの位置
+    gtfs_lon: Optional[float] = None
 
 
 class TrainPositionResponse(BaseModel):
@@ -85,6 +91,12 @@ class TrainPositionResponse(BaseModel):
     # GTFS-RT 生情報
     gtfs_stop_sequence: Optional[int] = None
     gtfs_status: Optional[int] = None
+    
+    # 比較表示用座標（Phase 1 追加）
+    timetable_lat: Optional[float] = None
+    timetable_lon: Optional[float] = None
+    gtfs_lat: Optional[float] = None
+    gtfs_lon: Optional[float] = None
 
     @classmethod
     def from_dataclass(cls, pos: TrainPosition) -> "TrainPositionResponse":
@@ -808,11 +820,16 @@ def train_state_to_position_with_override(
     gtfs_info: dict | None = None,
     override_from_station: str | None = None,
     override_to_station: str | None = None,
+    # 比較表示用座標
+    timetable_coords: tuple[float, float] | None = None,  # (lat, lon)
+    gtfs_coords: tuple[float, float] | None = None,       # (lat, lon)
 ) -> Optional[TrainPosition]:
     """
     TrainSectionState を TrainPosition（座標）に変換する。
     override_progress/override_from_station/override_to_station が指定された場合、
     state の値の代わりにその値を使用する。
+    
+    timetable_coords / gtfs_coords が指定された場合、比較表示用に保存する。
     """
     train = state.train
 
@@ -854,6 +871,11 @@ def train_state_to_position_with_override(
             data_quality=data_quality,
             gtfs_stop_sequence=stop_seq,
             gtfs_status=status,
+            # 比較表示用座標
+            timetable_lat=timetable_coords[0] if timetable_coords else None,
+            timetable_lon=timetable_coords[1] if timetable_coords else None,
+            gtfs_lat=gtfs_coords[0] if gtfs_coords else None,
+            gtfs_lon=gtfs_coords[1] if gtfs_coords else None,
         )
 
     # 走行中
@@ -888,6 +910,11 @@ def train_state_to_position_with_override(
         data_quality=data_quality,
         gtfs_stop_sequence=stop_seq,
         gtfs_status=status,
+        # 比較表示用座標
+        timetable_lat=timetable_coords[0] if timetable_coords else None,
+        timetable_lon=timetable_coords[1] if timetable_coords else None,
+        gtfs_lat=gtfs_coords[0] if gtfs_coords else None,
+        gtfs_lon=gtfs_coords[1] if gtfs_coords else None,
     )
 
 
@@ -999,7 +1026,32 @@ def get_blended_train_positions(
                 logger.warning(f"Neighbor search failed for {state.train.number}: {e}")
                 data_quality = "error"
         
-        # 4. 進捗率を座標に変換
+        # 4. 比較表示用の座標を計算
+        # (A) 純粋な時刻表位置（override なし）
+        timetable_coords = None
+        if not state.is_stopped:
+            tt_coords = _interpolate_coords(
+                state.from_station_id, 
+                state.to_station_id, 
+                state.progress, 
+                state.train.direction, 
+                cache
+            )
+            if tt_coords:
+                timetable_coords = (tt_coords[1], tt_coords[0])  # (lat, lon)
+        else:
+            # 停車中は駅座標を使用
+            station_id = state.stopped_at_station_id or state.from_station_id
+            coord = _get_station_coord(station_id, cache)
+            if coord:
+                timetable_coords = (coord[1], coord[0])  # (lat, lon)
+        
+        # (B) 純粋なGTFS-RT位置
+        gtfs_coords = None
+        if gtfs_position:
+            gtfs_coords = (gtfs_position.latitude, gtfs_position.longitude)
+        
+        # 5. 進捗率を座標に変換
         position = train_state_to_position_with_override(
             state, 
             cache, 
@@ -1008,6 +1060,8 @@ def get_blended_train_positions(
             gtfs_info=gtfs_info,
             override_from_station=final_from_station,
             override_to_station=final_to_station,
+            timetable_coords=timetable_coords,
+            gtfs_coords=gtfs_coords,
         )
         
         if position:

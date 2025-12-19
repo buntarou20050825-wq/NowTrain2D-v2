@@ -297,6 +297,12 @@ class DataCache:
         self.track_points: List[tuple[float, float]] = []  # 山手線全周の座標リスト
         self.station_track_indices: Dict[str, int] = {}    # 駅ID → track_pointsのインデックス
 
+        # MS1-TripUpdate: 列車番号から静的列車データへのインデックス
+        # key: (train_number, service_type), value: TimetableTrain
+        self._train_lookup: Dict[tuple[str, str], TimetableTrain] = {}
+        # key: (train_number, service_type), value: {stop_sequence: station_id}
+        self._seq_to_station_cache: Dict[tuple[str, str], Dict[int, str]] = {}
+
         # TODO (MS6): パフォーマンス最適化
         # self.railways_by_id: Dict[str, Dict[str, Any]] = {}
         # self.stations_by_id: Dict[str, Dict[str, Any]] = {}
@@ -344,6 +350,9 @@ class DataCache:
         # MS3-2: 山手線のセグメントを構築
         self.yamanote_segments = build_yamanote_segments(self.yamanote_trains)
         logger.info("Built %d Yamanote train segments", len(self.yamanote_segments))
+
+        # MS1-TripUpdate: 列車検索インデックスを構築
+        self._build_train_lookup_index()
 
         # MS3-3: 駅座標インデックスの構築
         station_positions: Dict[str, tuple[float, float]] = {}
@@ -459,3 +468,96 @@ class DataCache:
             mapped_count += 1
             
         logger.info("Mapped %d stations to track indices", mapped_count)
+
+    # ========================================================================
+    # MS1-TripUpdate: 列車検索・駅マッピングメソッド
+    # ========================================================================
+
+    def _build_train_lookup_index(self) -> None:
+        """
+        列車番号+サービスタイプから TimetableTrain を引けるインデックスを構築する。
+        同時に stop_sequence -> station_id のマップもキャッシュする。
+        """
+        self._train_lookup.clear()
+        self._seq_to_station_cache.clear()
+
+        for train in self.yamanote_trains:
+            key = (train.number, train.service_type)
+            
+            # 同一キーが重複する場合は最初のものを使用
+            if key not in self._train_lookup:
+                self._train_lookup[key] = train
+                
+                # stop_sequence -> station_id マップを構築
+                # TimetableTrain.stops には stop_sequence がないので、
+                # enumerate で 1 始まりの連番を生成する
+                seq_map: Dict[int, str] = {}
+                for seq, stop in enumerate(train.stops, start=1):
+                    seq_map[seq] = stop.station_id
+                
+                self._seq_to_station_cache[key] = seq_map
+
+        logger.info(
+            "Built train lookup index: %d entries, %d seq-to-station maps",
+            len(self._train_lookup),
+            len(self._seq_to_station_cache)
+        )
+
+    def get_static_train(
+        self, train_number: str | None, service_type: str | None
+    ) -> TimetableTrain | None:
+        """
+        列車番号から静的時刻表データを検索する。
+        
+        Args:
+            train_number: 列車番号 (例: "301G")
+            service_type: サービスタイプ (例: "Weekday", "SaturdayHoliday")
+                          指定されている場合は、そのタイプを優先する。
+        
+        Returns:
+            見つかった TimetableTrain、見つからない場合は None
+        """
+        if not train_number:
+            return None
+        
+        # 1. 完全一致を試す
+        if service_type:
+            result = self._train_lookup.get((train_number, service_type))
+            if result:
+                return result
+        
+        # 2. サービスタイプ関係なく探す（最初に見つかったものを返す）
+        for (num, st), train in self._train_lookup.items():
+            if num == train_number:
+                return train
+        
+        return None
+
+    def get_seq_to_station_map(
+        self, train_number: str | None, service_type: str | None
+    ) -> Dict[int, str] | None:
+        """
+        列車の stop_sequence -> station_id マップを取得する。
+        
+        Args:
+            train_number: 列車番号 (例: "301G")
+            service_type: サービスタイプ (例: "Weekday")
+        
+        Returns:
+            {stop_sequence: station_id} のマップ、見つからない場合は None
+        """
+        if not train_number:
+            return None
+        
+        # 1. 完全一致を試す
+        if service_type:
+            result = self._seq_to_station_cache.get((train_number, service_type))
+            if result:
+                return result
+        
+        # 2. サービスタイプ関係なく探す
+        for (num, st), seq_map in self._seq_to_station_cache.items():
+            if num == train_number:
+                return seq_map
+        
+        return None
