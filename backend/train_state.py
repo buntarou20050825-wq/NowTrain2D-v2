@@ -18,6 +18,13 @@ JST = ZoneInfo("Asia/Tokyo")
 # 04:00 から新しい「サービス日」が始まる
 SERVICE_DAY_START_HOUR = 4
 
+# ============================================================================
+# Phase 1: Blend Constants (GTFS-RT + Timetable hybrid)
+# ============================================================================
+BLEND_FACTOR = 0.3              # 補正の強さ（0.0〜1.0）
+STALE_THRESHOLD_SEC = 120       # これより古いGTFS-RTは無視（秒）
+MAX_PROGRESS_DELTA = 0.5        # 進捗差がこれ以上なら異常値として無視（0.3→0.5に緩和）
+
 
 # ============================================================================
 # Dataclass 定義
@@ -430,6 +437,49 @@ def debug_dump_trains_at(dt_jst: datetime, data_cache: DataCache, limit: int = 1
 
     if len(states) > limit:
         print(f"\n... 他 {len(states) - limit} 本\n")
+
+
+# ============================================================================
+# Phase 1: Blend Logic (GTFS-RT + Timetable hybrid)
+# ============================================================================
+
+def blend_progress(
+    ideal: float,
+    rt: float,
+    staleness_sec: float
+) -> tuple[float, str]:
+    """
+    時刻表ベースの進捗とGTFS-RTベースの進捗をブレンドする。
+    
+    Args:
+        ideal: 時刻表ベースの進捗 (0.0〜1.0)
+        rt: GTFS-RTベースの進捗 (0.0〜1.0)
+        staleness_sec: GTFS-RTデータの古さ（現在時刻 - GTFS-RTタイムスタンプ）
+    
+    Returns:
+        (blended_progress, data_quality)
+        - blended_progress: ブレンド後の進捗 (0.0〜1.0)
+        - data_quality: "good" | "stale" | "rejected" | "timetable_only"
+    """
+    # 1. 鮮度チェック: データが古すぎたら時刻表のみ使用
+    if staleness_sec > STALE_THRESHOLD_SEC:
+        return (max(0.0, min(1.0, ideal)), "timetable_only")
+    
+    # 2. 乖離チェック: 差が大きすぎたら異常値として無視
+    delta = rt - ideal
+    if abs(delta) > MAX_PROGRESS_DELTA:
+        return (max(0.0, min(1.0, ideal)), "rejected")
+    
+    # 3. ブレンド計算
+    blended = ideal + BLEND_FACTOR * delta
+    
+    # 4. 結果を 0.0〜1.0 にクランプ
+    blended = max(0.0, min(1.0, blended))
+    
+    # 5. データ品質の判定
+    quality = "good" if staleness_sec < 60 else "stale"
+    
+    return (blended, quality)
 
 
 # ============================================================================
