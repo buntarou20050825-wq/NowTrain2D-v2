@@ -7,6 +7,14 @@ import { fetchLinesFromApi } from "./api/serverData";
 const YAMANOTE_ID = "JR-East.Yamanote";
 const TRAIN_UPDATE_INTERVAL_MS = 2000;
 
+// Unix Timestamp を HH:MM:SS 形式に変換
+const formatTime = (ts) => {
+  if (!ts) return "--:--:--";
+  return new Date(ts * 1000).toLocaleTimeString('ja-JP', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+};
+
 // 位置データのソース切り替え
 // 'timetable' = 時刻表ベース（既存）
 // 'gtfs-rt'   = GTFS-RTリアルタイム（新規）
@@ -158,10 +166,11 @@ function App() {
               <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>GTFS-RT情報</b></td></tr>
               <tr><td><b>Stop Seq:</b></td><td>${props.stopSequence || 'N/A'}</td></tr>
               <tr><td><b>Status:</b></td><td>${getStatusText(props.gtfsStatus)}</td></tr>
-              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>座標比較</b></td></tr>
-              <tr><td><b>ブレンド:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
-              <tr><td><b>時刻表:</b></td><td>${props.timetableLat ? parseFloat(props.timetableLat).toFixed(5) + ', ' + parseFloat(props.timetableLon).toFixed(5) : 'N/A'}</td></tr>
-              <tr><td><b>GTFS-RT:</b></td><td>${props.gtfsLat ? parseFloat(props.gtfsLat).toFixed(5) + ', ' + parseFloat(props.gtfsLon).toFixed(5) : 'N/A'}</td></tr>
+              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>時刻情報</b></td></tr>
+              <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '到着時刻' : '前駅発車'}:</b></td><td>${formatTime(props.departureTimeRaw)}</td></tr>
+              <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '発車予定' : '次駅到着'}:</b></td><td>${formatTime(props.arrivalTimeRaw)}</td></tr>
+              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>座標</b></td></tr>
+              <tr><td><b>現在位置:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
             </table>
           </div>
         `;
@@ -680,6 +689,9 @@ function App() {
             // GTFS-RT情報
             stopSequence: train.stopSequence,
             gtfsStatus: train.status,
+            // 時刻情報（v4 API）
+            departureTimeRaw: train.departureTime,
+            arrivalTimeRaw: train.nextArrivalTime,
             // 比較座標（v4ではない）
             timetableLat: train.timetableLatitude,
             timetableLon: train.timetableLongitude,
