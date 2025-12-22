@@ -645,12 +645,326 @@ Mapbox GL JS の `case` 式を使って、列車の状態に応じて色を動�
 - **MS3-5**: 列車マーカーの路線形状追従 ✅
 - **MS4-1**: GTFS-RT データの取得とパース ✅
 - **MS4-2**: リアルタイム位置情報の取得 (VehiclePosition) ✅
-- **MS4-3**: 遅延情報の反映
-- **MS4-4**: リアルタイム位置のフロントエンド統合
+- **MS5**: TripUpdate ベースの v4 API + 線路形状追従 ✅
+- **MS6**: 遅延情報の取得と可視化 ✅
+- **MS7**: イージングによる加減速表現 ✅ → MS8 で置換
+- **MS8**: 物理演算ベースの台形速度制御 ✅
+- **MS9**: クライアントサイド補間アニメーション (60fps) ✅
 
 ---
 
-## MS3-5: 列車マーカーの路線形状追従 ✅
+## MS5: TripUpdate ベースの v4 API + 線路形状追従 ✅
+
+### 概要
+
+GTFS-RT の **TripUpdate** から取得した予測発着時刻を使って列車位置を計算する新しい v4 API を実装しました。VehiclePosition（座標直接取得）ではなく、時刻ベースで位置を算出することで、より安定した表示を実現します。
+
+### 実装内容
+
+#### 1. TripUpdate パーサー (`backend/gtfs_rt_tripupdate.py`)
+
+**データクラス:**
+- `RealtimeStationSchedule`: 1駅の到着/発車予測時刻
+- `TrainSchedule`: 1列車の全駅スケジュール
+
+**主要関数:**
+- `fetch_trip_updates()`: GTFS-RT から山手線の予測時刻を取得
+- `trip_id` のパターンで山手線をフィルタ（`42...G` 形式）
+
+#### 2. 位置計算エンジン (`backend/train_position_v4.py`)
+
+**データクラス:**
+- `SegmentProgress`: 列車の現在区間と進捗率
+
+**主要関数:**
+- `compute_progress_for_train()`: 予測時刻から進捗率を計算
+- `calculate_coordinates()`: 進捗率から線路形状に沿った座標を算出
+
+#### 3. v4 API エンドポイント (`backend/main.py`)
+
+```
+GET /api/trains/yamanote/positions/v4
+```
+
+**レスポンス例:**
+```json
+{
+  "source": "tripupdate_v4",
+  "status": "success",
+  "total_trains": 26,
+  "positions": [
+    {
+      "trip_id": "4211004G",
+      "train_number": "1004G",
+      "direction": "InnerLoop",
+      "status": "running",
+      "progress": 0.67,
+      "delay": 0,
+      "location": {
+        "latitude": 35.628541,
+        "longitude": 139.720505
+      },
+      "segment": {
+        "prev_seq": 29,
+        "next_seq": 30,
+        "prev_station_id": "JR-East.Yamanote.Meguro",
+        "next_station_id": "JR-East.Yamanote.Gotanda"
+      },
+      "times": {
+        "now_ts": 1766371826,
+        "t0_departure": 1766371756,
+        "t1_arrival": 1766371860
+      }
+    }
+  ]
+}
+```
+
+### MS5 完了の確認項目
+
+- [x] `backend/gtfs_rt_tripupdate.py` を作成
+- [x] `backend/train_position_v4.py` を作成
+- [x] `/api/trains/yamanote/positions/v4` エンドポイントを実装
+- [x] `calculate_coordinates()` で線路形状に沿った座標を計算
+- [x] フロントエンドを v4 API に移行
+
+---
+
+## MS6: 遅延情報の取得と可視化 ✅
+
+### 概要
+
+GTFS-RT TripUpdate に含まれる遅延秒数（`delay`）をバックエンドで取得し、フロントエンドで色分け表示・ポップアップ表示を行います。
+
+### 実装内容
+
+#### バックエンド
+
+| ファイル | 変更内容 |
+|---------|---------|
+| `gtfs_rt_tripupdate.py` | `RealtimeStationSchedule.delay` フィールド追加 |
+| `train_position_v4.py` | `SegmentProgress.delay` フィールド追加 |
+| `main.py` | v4 API レスポンスに `delay` 追加 |
+
+**遅延取得ロジック:**
+1. `stu.arrival.delay` を優先
+2. なければ `stu.departure.delay`
+3. 両方なければ `0`
+
+**SegmentProgress への反映:**
+- `status="stopped"` → 現在駅の発車遅延
+- `status="running"` → 次駅の到着遅延
+
+#### フロントエンド (`frontend/src/App.jsx`)
+
+**色分けルール:**
+
+| 遅延秒数 | 色 | 意味 |
+|---------|-----|-----|
+| 0〜59秒 | 🟢 `#00B140` | 定刻 |
+| 60〜299秒 | 🟠 `#FFA500` | 1〜5分遅れ |
+| 300秒〜 | 🔴 `#FF4500` | 5分以上遅れ |
+| dataQuality=rejected | 🟣 紫 | データ品質不良 |
+
+**ポップアップ表示:**
+- 60秒以上の遅延がある場合のみ表示
+- 形式: `遅延: +X分`
+- 遅延度合いに応じて文字色を変更
+
+### MS6 完了の確認項目
+
+- [x] `RealtimeStationSchedule` に `delay` フィールド追加
+- [x] `SegmentProgress` に `delay` フィールド追加
+- [x] v4 API レスポンスに `delay` フィールド追加
+- [x] フロントエンドで `step` 式による色分け実装
+- [x] ポップアップに遅延情報を表示
+
+---
+
+## MS7: イージングによる加減速表現 ✅ → MS8 で置換
+
+### 概要
+
+列車の動きを「等速移動」から「発車時はゆっくり、中間は速く、到着前は減速」に変更する Ease-in-out Cubic 関数を実装しました。
+
+**注意**: MS8 でより現実的な物理演算に置き換えられました。
+
+---
+
+## MS8: 物理演算ベースの台形速度制御 ✅
+
+### 概要
+
+山手線 E235 系の実スペックに基づいた **台形速度制御（Trapezoidal Velocity Profile）** を実装し、列車の動きを極限までリアルにしました。
+
+### 車両性能パラメータ
+
+| パラメータ | 値 | 説明 |
+|----------|-----|------|
+| 加速度 | 3.0 km/h/s | 0→90km/h まで 30秒 |
+| 減速度 | 4.2 km/h/s | 90→0km/h まで 約25秒 |
+
+### 速度プロファイル
+
+```
+速度 ▲
+     │      ┌──────────┐
+     │     /            \
+     │    /              \
+     │   /                \
+     └──┴────────────────┴──→ 時間
+       加速     定速     減速
+       30s              25s
+```
+
+### 実装内容 (`backend/train_position_v4.py`)
+
+```python
+def calculate_physics_progress(elapsed_time: float, total_duration: float) -> float:
+    """
+    山手線E235系の性能に基づく台形速度制御で進捗率(0.0-1.0)を計算する。
+    """
+    T_ACC = 30.0  # 加速時間
+    T_DEC = 25.0  # 減速時間
+    
+    # 短区間の場合は「三角走行」に自動調整
+    if total_duration < (T_ACC + T_DEC):
+        factor = total_duration / (T_ACC + T_DEC)
+        t_acc, t_dec = T_ACC * factor, T_DEC * factor
+    else:
+        t_acc, t_dec = T_ACC, T_DEC
+    
+    # 速度プロファイルを積分して位置を計算
+    ...
+```
+
+### 効果
+
+- **発車時**: ゆっくり動き出し、30秒かけて最高速度へ
+- **定速走行**: 最高速度を維持
+- **到着時**: 25秒かけてスムーズに減速・停止
+- **短区間**: 加速→即減速の「三角走行」に自動調整
+
+### MS8 完了の確認項目
+
+- [x] `calculate_physics_progress()` 関数を実装
+- [x] MS7 の `ease_in_out_cubic()` を置換
+- [x] 加速・定速・減速の3フェーズを正しく計算
+- [x] 短区間での三角走行に対応
+
+---
+
+## MS9: クライアントサイド補間アニメーション (60fps) ✅
+
+### 概要
+
+API ポーリング間隔（2秒）を維持しつつ、フロントエンドで `requestAnimationFrame` を使って中間位置を補間し、60fps の滑らかなアニメーションを実現しました。
+
+### 実装内容 (`frontend/src/App.jsx`)
+
+#### 1. アニメーション用 Ref
+
+```javascript
+const animationRef = useRef(null);         // rAF ID
+const trainPositionsRef = useRef({});      // { trainNumber: { current, target, startTime, properties } }
+const lastFetchTimeRef = useRef(0);
+```
+
+#### 2. 目標位置の更新 (`fetchAndUpdate` 内)
+
+API からデータを受信したら:
+- 初回: `current` と `target` に同じ座標をセット
+- 2回目以降: 古い `target` → `current`、新座標 → `target`
+
+#### 3. アニメーションループ
+
+```javascript
+useEffect(() => {
+  const animateTrains = () => {
+    const now = performance.now();
+    const duration = TRAIN_UPDATE_INTERVAL_MS; // 2000ms
+    
+    const features = Object.keys(trainPositionsRef.current).map(key => {
+      const train = trainPositionsRef.current[key];
+      const t = Math.min(1.0, (now - train.startTime) / duration);
+      
+      // LERP補間
+      const lon = train.current[0] + (train.target[0] - train.current[0]) * t;
+      const lat = train.current[1] + (train.target[1] - train.current[1]) * t;
+      
+      return {
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [lon, lat] },
+        properties: { ...train.properties, lon, lat },
+      };
+    });
+    
+    src.setData({ type: "FeatureCollection", features });
+    animationRef.current = requestAnimationFrame(animateTrains);
+  };
+  
+  animationRef.current = requestAnimationFrame(animateTrains);
+  
+  return () => {
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
+  };
+}, []);
+```
+
+### 効果
+
+- ワープ移動が **スーッと滑らかな移動** に変化
+- MS8 の物理演算による加減速が **アニメーション速度の緩急** として可視化
+- CPU 負荷を抑えつつ 60fps を維持
+
+### MS9 完了の確認項目
+
+- [x] `animationRef`, `trainPositionsRef`, `lastFetchTimeRef` を追加
+- [x] `fetchAndUpdate` で目標位置を更新
+- [x] `requestAnimationFrame` でアニメーションループを実装
+- [x] LERP 補間で滑らかな移動を実現
+- [x] コンポーネントアンマウント時に `cancelAnimationFrame`
+
+---
+
+## デバッグツール
+
+### TripUpdate 更新監視 (`backend/watch_updates.py`)
+
+GTFS-RT の予測時刻が実際にリアルタイム更新されていることを検証するツール。
+
+```bash
+cd backend
+python watch_updates.py
+```
+
+**機能:**
+- 20秒間隔で TripUpdate API をポーリング
+- 到着/発車時刻の変化を検出して表示
+- 遅延秒数の変化（改善/悪化）を追跡
+- 列車の増減を検出
+
+**出力例:**
+```
+[12:05:23] ポーリング#3 - 列車数: 26
+  🚅 [1205G] Shinjuku: 到着 12:00:00 → 12:00:15 (+15s) (Delay: 60s)
+  ⏱️  [1422G] Shibuya: 遅延 60s → 90s (悪化)
+  📊 今回の変化: 2件 (累計: 5件)
+```
+
+---
+
+## ライセンス
+
+このプロジェクトは教育目的の卒業制作です。Mini Tokyo 3D のデータとアイデアを参考にしていますが、コードは独自に実装されています。
+
+## 謝辞
+
+- [Mini Tokyo 3D](https://github.com/nagix/mini-tokyo-3d) - データ形式とアイデアの参考元
+- [Mapbox GL JS](https://www.mapbox.com/) - 地図表示ライブラリ
+- [公共交通オープンデータセンター (ODPT)](https://developer.odpt.org/) - リアルタイム列車情報 API
+
+
 
 ### 概要
 

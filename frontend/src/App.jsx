@@ -74,6 +74,11 @@ function App() {
   // ========== GTFS-RT更新遅延計測用 ==========
   const trainStatesRef = useRef({});  // { trainNumber: { stopSeq, lastUpdate } }
 
+  // ========== MS9: クライアントサイド補間アニメーション ==========
+  const animationRef = useRef(null); // rAF ID
+  const trainPositionsRef = useRef({}); // { trainNumber: { current, target, startTime, properties } }
+  const lastFetchTimeRef = useRef(0);
+
   // trackedTrain同期
   useEffect(() => {
     trackedTrainRef.current = trackedTrain;
@@ -88,6 +93,45 @@ function App() {
   useEffect(() => {
     displayModeRef.current = displayMode;
   }, [displayMode]);
+
+  // ========== MS9: 60fps アニメーションループ ==========
+  useEffect(() => {
+    const animateTrains = () => {
+      const map = mapRef.current;
+      const src = map?.getSource("yamanote-trains");
+
+      if (!src || Object.keys(trainPositionsRef.current).length === 0) {
+        animationRef.current = requestAnimationFrame(animateTrains);
+        return;
+      }
+
+      const now = performance.now();
+      const duration = TRAIN_UPDATE_INTERVAL_MS;
+
+      const features = Object.keys(trainPositionsRef.current).map(key => {
+        const train = trainPositionsRef.current[key];
+        const t = Math.min(1.0, (now - train.startTime) / duration);
+
+        const lon = train.current[0] + (train.target[0] - train.current[0]) * t;
+        const lat = train.current[1] + (train.target[1] - train.current[1]) * t;
+
+        return {
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [lon, lat] },
+          properties: { ...train.properties, lon, lat },
+        };
+      });
+
+      src.setData({ type: "FeatureCollection", features });
+      animationRef.current = requestAnimationFrame(animateTrains);
+    };
+
+    animationRef.current = requestAnimationFrame(animateTrains);
+
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (mapRef.current) return;
@@ -715,6 +759,36 @@ function App() {
           },
           properties: { ...p },
         })) : [];
+
+        // MS9: 目標位置を更新（アニメーション用）
+        const animNow = performance.now();
+        filteredPositions.forEach(p => {
+          const key = p.trainNumber;
+          const newTarget = [p.lon, p.lat];
+
+          if (!trainPositionsRef.current[key]) {
+            trainPositionsRef.current[key] = {
+              current: newTarget.slice(),
+              target: newTarget.slice(),
+              startTime: animNow,
+              properties: { ...p },
+            };
+          } else {
+            const old = trainPositionsRef.current[key];
+            trainPositionsRef.current[key] = {
+              current: old.target.slice(),
+              target: newTarget.slice(),
+              startTime: animNow,
+              properties: { ...p },
+            };
+          }
+        });
+
+        const activeTrains = new Set(filteredPositions.map(p => p.trainNumber));
+        Object.keys(trainPositionsRef.current).forEach(key => {
+          if (!activeTrains.has(key)) delete trainPositionsRef.current[key];
+        });
+        lastFetchTimeRef.current = animNow;
 
         src.setData({
           type: "FeatureCollection",

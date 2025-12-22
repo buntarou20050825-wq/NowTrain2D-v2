@@ -7,6 +7,7 @@ TrainSchedule（MS1の成果物）から現在区間と進捗率を計算する�
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -19,6 +20,41 @@ logger = logging.getLogger(__name__)
 # 参考: https://internet.watch.impress.co.jp/docs/interview/1434086.html
 # 「最も誤差が少ないと思われる"毎分25秒"を基準にしました」
 DEFAULT_STOP_DURATION = 25
+
+
+# ============================================================================
+# MS8: 物理演算ベースの台形速度制御 (E235系)
+# ============================================================================
+
+def calculate_physics_progress(elapsed_time: float, total_duration: float) -> float:
+    """
+    山手線E235系の性能に基づく台形速度制御で進捗率(0.0-1.0)を計算する。
+    """
+    if total_duration <= 0: return 1.0
+    if elapsed_time <= 0: return 0.0
+    if elapsed_time >= total_duration: return 1.0
+    
+    T_ACC = 30.0  # 加速時間 (0->90km/h)
+    T_DEC = 25.0  # 減速時間 (90km/h->0)
+    
+    if total_duration < (T_ACC + T_DEC):
+        factor = total_duration / (T_ACC + T_DEC)
+        t_acc, t_dec = T_ACC * factor, T_DEC * factor
+    else:
+        t_acc, t_dec = T_ACC, T_DEC
+    
+    t_const = total_duration - t_acc - t_dec
+    v_peak = 1.0 / (0.5 * t_acc + t_const + 0.5 * t_dec)
+    
+    if elapsed_time < t_acc:
+        return 0.5 * (v_peak / t_acc) * (elapsed_time ** 2)
+    elif elapsed_time < (t_acc + t_const):
+        dist_acc = 0.5 * v_peak * t_acc
+        return dist_acc + v_peak * (elapsed_time - t_acc)
+    else:
+        time_left = total_duration - elapsed_time
+        return 1.0 - 0.5 * (v_peak / t_dec) * (time_left ** 2)
+
 
 
 # ============================================================================
@@ -196,10 +232,10 @@ def compute_progress_for_train(
         
         # 現在時刻がこの区間内か判定
         if t0 <= now_ts <= t1:
-            # 進捗率計算
-            progress = (now_ts - t0) / (t1 - t0)
-            # clamp to 0.0〜1.0
-            progress = max(0.0, min(1.0, progress))
+            # MS8: 物理演算ベースの台形速度制御
+            elapsed = now_ts - t0
+            duration = t1 - t0
+            eased_progress = calculate_physics_progress(elapsed, duration)
             
             return SegmentProgress(
                 trip_id=trip_id,
@@ -212,7 +248,7 @@ def compute_progress_for_train(
                 now_ts=now_ts,
                 t0_departure=t0,
                 t1_arrival=t1,
-                progress=progress,
+                progress=eased_progress,  # MS8: 物理演算適用済み
                 status="running",
                 feed_timestamp=schedule.feed_timestamp,
                 segment_count=len(seqs) - 1,
