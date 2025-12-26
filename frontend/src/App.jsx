@@ -2,10 +2,22 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { fetchRailways, fetchStations, fetchCoordinates } from "./api/staticData";
+// fetchLinesFromApi は今回使わないので削除してもOKですが残しておきます
 import { fetchLinesFromApi } from "./api/serverData";
 
-const YAMANOTE_ID = "JR-East.Yamanote";
+// ==========================================
+// 設定: 対応路線リスト
+// ==========================================
+const AVAILABLE_LINES = [
+  { id: 'yamanote', name: '山手線', railwayId: 'JR-East.Yamanote', color: '#80C342' },
+  { id: 'chuo_rapid', name: '中央線快速', railwayId: 'JR-East.ChuoRapid', color: '#EB5C01' },
+  { id: 'keihin_tohoku', name: '京浜東北線', railwayId: 'JR-East.KeihinTohokuNegishi', color: '#00A7E3' },
+  { id: 'sobu_local', name: '総武線各駅停車', railwayId: 'JR-East.ChuoSobuLocal', color: '#FFE500' },
+];
+
 const TRAIN_UPDATE_INTERVAL_MS = 2000;
+// 線路データの「飛び」を検知して分割する閾値 (度数法: 0.02度 ≒ 約2.2km)
+const MAX_SEGMENT_DISTANCE = 0.02;
 
 // Unix Timestamp を HH:MM:SS 形式に変換
 const formatTime = (ts) => {
@@ -15,90 +27,75 @@ const formatTime = (ts) => {
   });
 };
 
-// 位置データのソース切り替え
-// 'timetable' = 時刻表ベース（既存）
-// 'gtfs-rt'   = GTFS-RTリアルタイム（新規）
-// 'hybrid'    = ハイブリッド（時刻表補間 + GTFS-RT補正）
-const POSITION_SOURCE = 'hybrid';
+// ==========================================
+// ユーティリティ: 線路データのクリーニング
+// ==========================================
+// 座標リストを受け取り、距離が離れすぎている箇所で分割して MultiLineString 用の配列を返す
+const cleanLineSegments = (coords) => {
+  if (!Array.isArray(coords) || coords.length < 2) return [coords];
 
-// 山手線30駅の座標（外回り順）
-const YAMANOTE_STATIONS = [
-  { id: 'Osaki', lat: 35.6202, lon: 139.7282 },
-  { id: 'Gotanda', lat: 35.6263, lon: 139.7234 },
-  { id: 'Meguro', lat: 35.6335, lon: 139.7157 },
-  { id: 'Ebisu', lat: 35.6466, lon: 139.7098 },
-  { id: 'Shibuya', lat: 35.6580, lon: 139.7015 },
-  { id: 'Harajuku', lat: 35.6713, lon: 139.7026 },
-  { id: 'Yoyogi', lat: 35.6835, lon: 139.7021 },
-  { id: 'Shinjuku', lat: 35.6902, lon: 139.7004 },
-  { id: 'ShinOkubo', lat: 35.7007, lon: 139.7001 },
-  { id: 'Takadanobaba', lat: 35.7127, lon: 139.7037 },
-  { id: 'Mejiro', lat: 35.7202, lon: 139.7062 },
-  { id: 'Ikebukuro', lat: 35.7299, lon: 139.7109 },
-  { id: 'Otsuka', lat: 35.7316, lon: 139.7279 },
-  { id: 'Sugamo', lat: 35.7338, lon: 139.7403 },
-  { id: 'Komagome', lat: 35.7368, lon: 139.7479 },
-  { id: 'Tabata', lat: 35.7374, lon: 139.7615 },
-  { id: 'NishiNippori', lat: 35.7318, lon: 139.7668 },
-  { id: 'Nippori', lat: 35.7271, lon: 139.7709 },
-  { id: 'Uguisudani', lat: 35.7213, lon: 139.7779 },
-  { id: 'Ueno', lat: 35.7135, lon: 139.7768 },
-  { id: 'Okachimachi', lat: 35.7071, lon: 139.7745 },
-  { id: 'Akihabara', lat: 35.6982, lon: 139.7729 },
-  { id: 'Kanda', lat: 35.6916, lon: 139.7706 },
-  { id: 'Tokyo', lat: 35.6813, lon: 139.7670 },
-  { id: 'Yurakucho', lat: 35.6749, lon: 139.7629 },
-  { id: 'Shimbashi', lat: 35.6663, lon: 139.7579 },
-  { id: 'Hamamatsucho', lat: 35.6555, lon: 139.7570 },
-  { id: 'Tamachi', lat: 35.6457, lon: 139.7476 },
-  { id: 'TakanawaGateway', lat: 35.6354, lon: 139.7407 },
-  { id: 'Shinagawa', lat: 35.6288, lon: 139.7387 },
-];
+  const segments = [];
+  let currentSegment = [coords[0]];
+
+  for (let i = 1; i < coords.length; i++) {
+    const prev = coords[i - 1];
+    const curr = coords[i];
+
+    // 距離の二乗（簡易計算）
+    const distSq = (prev[0] - curr[0]) ** 2 + (prev[1] - curr[1]) ** 2;
+
+    // 閾値を超えていたら分割 (閾値の2乗と比較)
+    if (distSq > MAX_SEGMENT_DISTANCE ** 2) {
+      if (currentSegment.length > 1) {
+        segments.push(currentSegment);
+      }
+      currentSegment = [curr];
+    } else {
+      currentSegment.push(curr);
+    }
+  }
+
+  if (currentSegment.length > 1) {
+    segments.push(currentSegment);
+  }
+
+  return segments;
+};
+
 
 function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
-  // ========== 列車追跡機能 ==========
+
+  // ========== 状態管理 ==========
+  const [selectedLine, setSelectedLine] = useState('yamanote'); // 現在の路線ID
+  const selectedLineRef = useRef('yamanote'); // ポーリング内で参照するためRefも使う
+
   const [trackedTrain, setTrackedTrain] = useState(null);
   const trackedTrainRef = useRef(null);
 
-  // ========== 電車ID検索機能 ==========
   const [searchQuery, setSearchQuery] = useState("");
   const searchQueryRef = useRef("");
 
-  // ========== 表示モード切り替え ==========
-  // 'all' = 全て表示, 'timetable' = 時刻表のみ, 'gtfs' = GTFS-RTのみ, 'blend' = ブレンドのみ
   const [displayMode, setDisplayMode] = useState("all");
   const displayModeRef = useRef("all");
 
-  // ========== GTFS-RT更新遅延計測用 ==========
-  const trainStatesRef = useRef({});  // { trainNumber: { stopSeq, lastUpdate } }
-
-  // ========== MS9: クライアントサイド補間アニメーション ==========
-  const animationRef = useRef(null); // rAF ID
+  // ========== アニメーション管理 ==========
+  const animationRef = useRef(null);
   const trainPositionsRef = useRef({}); // { trainNumber: { current, target, startTime, properties } }
-  const lastFetchTimeRef = useRef(0);
 
-  // trackedTrain同期
-  useEffect(() => {
-    trackedTrainRef.current = trackedTrain;
-  }, [trackedTrain]);
+  // State同期 (useEffect内での参照用)
+  useEffect(() => { selectedLineRef.current = selectedLine; }, [selectedLine]);
+  useEffect(() => { trackedTrainRef.current = trackedTrain; }, [trackedTrain]);
+  useEffect(() => { searchQueryRef.current = searchQuery; }, [searchQuery]);
+  useEffect(() => { displayModeRef.current = displayMode; }, [displayMode]);
 
-  // searchQuery同期
-  useEffect(() => {
-    searchQueryRef.current = searchQuery;
-  }, [searchQuery]);
-
-  // displayMode同期
-  useEffect(() => {
-    displayModeRef.current = displayMode;
-  }, [displayMode]);
-
-  // ========== MS9: 60fps アニメーションループ ==========
+  // ========== 60fps アニメーションループ ==========
   useEffect(() => {
     const animateTrains = () => {
       const map = mapRef.current;
-      const src = map?.getSource("yamanote-trains");
+      // 現在の路線のソースを取得
+      const src = map?.getSource("trains-source");
 
       if (!src || Object.keys(trainPositionsRef.current).length === 0) {
         animationRef.current = requestAnimationFrame(animateTrains);
@@ -127,12 +124,12 @@ function App() {
     };
 
     animationRef.current = requestAnimationFrame(animateTrains);
-
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
   }, []);
 
+  // ========== マップ初期化 (初回のみ) ==========
   useEffect(() => {
     if (mapRef.current) return;
 
@@ -141,839 +138,349 @@ function App() {
     const map = new mapboxgl.Map({
       container: mapContainerRef.current,
       style: "mapbox://styles/mapbox/streets-v12",
-      center: [139.70, 35.68],
+      center: [139.70, 35.68], // 東京周辺
       zoom: 11,
     });
 
     mapRef.current = map;
 
-    map.on("load", async () => {
-      // データ読み込み
-      const railways = await fetchRailways();
-      if (!railways) {
-        console.error("Failed to load railways data");
-        return;
-      }
-
-      const stations = await fetchStations();
-      if (!stations) {
-        console.error("Failed to load stations data");
-        return;
-      }
-
-      const coordsData = await fetchCoordinates();
-      if (!coordsData) {
-        console.error("Failed to load coordinates data");
-        return;
-      }
-      // ========== ポップアップ設定 ==========
-      // useEffect内、マップ初期化後に追加
-
-      // ポップアップを作成
-      const popup = new mapboxgl.Popup({
-        closeButton: true,
-        closeOnClick: false,
-      });
-
-      // マーカークリック時にポップアップ表示
-      map.on('click', 'yamanote-trains-circle', (e) => {
-        const feature = e.features[0];
-        const props = feature.properties;
-        const coords = feature.geometry.coordinates;
-
-        // GTFS Status をテキストに変換
-        const getStatusText = (status) => {
-          switch (status) {
-            case 1: return '停車中';
-            case 2: return '走行中';
-            default: return status ? `不明(${status})` : 'N/A';
-          }
-        };
-
-        // 駅IDから駅名を抽出（簡易）
-        const getShortStationName = (stationId) => {
-          if (!stationId) return 'N/A';
-          return stationId.split('.').pop() || stationId;
-        };
-
-        const html = `
-          <div style="font-family: sans-serif; font-size: 12px; min-width: 220px;">
-            <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px;">
-              🚃 ${props.trainNumber} (${props.direction === 'OuterLoop' ? '外回り' : '内回り'})
-            </h3>
-            <table style="width: 100%; border-collapse: collapse;">
-              <tr><td><b>品質:</b></td><td>${props.dataQuality || 'N/A'}</td></tr>
-              <tr><td><b>状態:</b></td><td>${props.isStopped === 'true' || props.isStopped === true ? '停車中' : '走行中'}</td></tr>
-              <tr><td><b>停車駅:</b></td><td>${getShortStationName(props.stationId)}</td></tr>
-              <tr><td><b>区間:</b></td><td>${getShortStationName(props.fromStation)} → ${getShortStationName(props.toStation)}</td></tr>
-              <tr><td><b>進捗:</b></td><td>${(parseFloat(props.progress) * 100).toFixed(1)}%</td></tr>
-              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>GTFS-RT情報</b></td></tr>
-              <tr><td><b>Stop Seq:</b></td><td>${props.stopSequence || 'N/A'}</td></tr>
-              <tr><td><b>Status:</b></td><td>${getStatusText(props.gtfsStatus)}</td></tr>
-              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>時刻情報</b></td></tr>
-              <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '到着時刻' : '前駅発車'}:</b></td><td>${formatTime(props.departureTimeRaw)}</td></tr>
-              <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '発車予定' : '次駅到着'}:</b></td><td>${formatTime(props.arrivalTimeRaw)}</td></tr>
-              ${parseInt(props.delaySeconds) >= 60 ? `<tr><td><b style="color: ${parseInt(props.delaySeconds) >= 300 ? '#FF4500' : '#FFA500'}">遅延:</b></td><td style="color: ${parseInt(props.delaySeconds) >= 300 ? '#FF4500' : '#FFA500'}; font-weight: bold;">+${Math.floor(parseInt(props.delaySeconds) / 60)}分</td></tr>` : ''}
-              <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>座標</b></td></tr>
-              <tr><td><b>現在位置:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
-            </table>
-          </div>
-        `;
-
-        popup.setLngLat(coords).setHTML(html).addTo(map);
-      });
-
-      // ★ 時刻表マーカー（Ghost）クリック時のポップアップ
-      map.on('click', 'yamanote-trains-timetable-circle', (e) => {
-        const feature = e.features[0];
-        const props = feature.properties;
-        const coords = feature.geometry.coordinates;
-
-        const html = `
-          <div style="font-family: sans-serif; font-size: 12px; min-width: 180px;">
-            <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px; color: #888;">
-              📍 ${props.trainNumber} - 時刻表位置
-            </h3>
-            <table style="width: 100%; border-collapse: collapse;">
-              <tr><td><b>方向:</b></td><td>${props.direction === 'OuterLoop' ? '外回り' : '内回り'}</td></tr>
-              <tr><td><b>タイプ:</b></td><td>時刻表ベース（予定位置）</td></tr>
-              <tr><td><b>座標:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
-            </table>
-          </div>
-        `;
-
-        popup.setLngLat(coords).setHTML(html).addTo(map);
-      });
-
-      // ★ GTFS-RTマーカー（実測）クリック時のポップアップ
-      map.on('click', 'yamanote-trains-gtfs-circle', (e) => {
-        const feature = e.features[0];
-        const props = feature.properties;
-        const coords = feature.geometry.coordinates;
-
-        const html = `
-          <div style="font-family: sans-serif; font-size: 12px; min-width: 180px;">
-            <h3 style="margin: 0 0 8px 0; border-bottom: 1px solid #FF5722; padding-bottom: 4px; color: #FF5722;">
-              📡 ${props.trainNumber} - GTFS-RT位置
-            </h3>
-            <table style="width: 100%; border-collapse: collapse;">
-              <tr><td><b>方向:</b></td><td>${props.direction === 'OuterLoop' ? '外回り' : '内回り'}</td></tr>
-              <tr><td><b>タイプ:</b></td><td>GTFS-RT実測位置</td></tr>
-              <tr><td><b>座標:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
-            </table>
-          </div>
-        `;
-
-        popup.setLngLat(coords).setHTML(html).addTo(map);
-      });
-
-      // カーソルをポインターに
-      map.on('mouseenter', 'yamanote-trains-circle', () => {
-        map.getCanvas().style.cursor = 'pointer';
-      });
-      map.on('mouseleave', 'yamanote-trains-circle', () => {
-        map.getCanvas().style.cursor = '';
-      });
-
-      // ★ 時刻表マーカーのカーソル
-      map.on('mouseenter', 'yamanote-trains-timetable-circle', () => {
-        map.getCanvas().style.cursor = 'pointer';
-      });
-      map.on('mouseleave', 'yamanote-trains-timetable-circle', () => {
-        map.getCanvas().style.cursor = '';
-      });
-
-      // ★ GTFS-RTマーカーのカーソル
-      map.on('mouseenter', 'yamanote-trains-gtfs-circle', () => {
-        map.getCanvas().style.cursor = 'pointer';
-      });
-      map.on('mouseleave', 'yamanote-trains-gtfs-circle', () => {
-        map.getCanvas().style.cursor = '';
-      });
-
-      // 山手線データの抽出
-      const yamanoteLine = railways.find((r) => r.id === YAMANOTE_ID);
-      const yamanoteStationIds = yamanoteLine?.stations || [];
-
-      const yamanoteStations = stations.filter((st) =>
-        yamanoteStationIds.includes(st.id)
-      );
-
-      // 山手線の座標データを取得
-      const railwayCoords = coordsData.railways || [];
-      const yamanoteCoordsEntry = railwayCoords.find((c) => c.id === YAMANOTE_ID);
-
-      let yamanoteCoords = [];
-      if (yamanoteCoordsEntry && Array.isArray(yamanoteCoordsEntry.sublines)) {
-        let previousEnd = null;
-
-        for (const sub of yamanoteCoordsEntry.sublines) {
-          if (!Array.isArray(sub.coords) || sub.coords.length === 0) continue;
-
-          let coords = sub.coords;
-
-          if (previousEnd) {
-            const first = coords[0];
-            const last = coords[coords.length - 1];
-
-            const distFirst =
-              (first[0] - previousEnd[0]) ** 2 + (first[1] - previousEnd[1]) ** 2;
-            const distLast =
-              (last[0] - previousEnd[0]) ** 2 + (last[1] - previousEnd[1]) ** 2;
-
-            if (distLast < distFirst) {
-              coords = [...coords].reverse();
-            }
-          }
-
-          yamanoteCoords = yamanoteCoords.concat(coords);
-          previousEnd = coords[coords.length - 1];
-        }
-      }
-
-      console.log("Yamanote Line:", yamanoteLine);
-      console.log("Yamanote Stations:", yamanoteStations.length);
-      console.log("Yamanote Coords:", yamanoteCoords.length);
-
-      // GeoJSON の構築
-      const yamanoteLineFeature = {
-        type: "Feature",
-        geometry: {
-          type: "LineString",
-          coordinates: yamanoteCoords,
-        },
-        properties: {
-          id: YAMANOTE_ID,
-          name_ja: yamanoteLine?.title?.ja || "山手線",
-          name_en: yamanoteLine?.title?.en || "Yamanote Line",
-        },
-      };
-
-      const yamanoteStationFeatures = yamanoteStations.map((st) => ({
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: st.coord,
-        },
-        properties: {
-          id: st.id,
-          railway: st.railway,
-          name_ja: st.title?.ja || "",
-          name_en: st.title?.en || "",
-        },
-      }));
-
-      const yamanoteStationsCollection = {
-        type: "FeatureCollection",
-        features: yamanoteStationFeatures,
-      };
-
-      const yamanoteLineCollection = {
-        type: "FeatureCollection",
-        features: [yamanoteLineFeature],
-      };
-
-      // 山手線の線を追加
-      map.addSource("yamanote-line", {
+    map.on("load", () => {
+      // 共通ソース: 路線図 (LineString)
+      map.addSource("railway-line", {
         type: "geojson",
-        data: yamanoteLineCollection,
+        data: { type: "FeatureCollection", features: [] }
       });
-
       map.addLayer({
-        id: "yamanote-line-layer",
+        id: "railway-line-layer",
         type: "line",
-        source: "yamanote-line",
+        source: "railway-line",
         paint: {
-          "line-color": "#80C342", // 山手線の黄緑
-          "line-width": 3,
+          "line-color": "#80C342", // 初期値
+          "line-width": 4,
         },
-      });
+      }, 'road-label'); // 道路ラベルの下に表示
 
-      // 駅を追加
-      map.addSource("yamanote-stations", {
+      // 共通ソース: 駅 (Point)
+      map.addSource("stations", {
         type: "geojson",
-        data: yamanoteStationsCollection,
+        data: { type: "FeatureCollection", features: [] }
       });
-
       map.addLayer({
-        id: "yamanote-stations-circle",
+        id: "stations-circle",
         type: "circle",
-        source: "yamanote-stations",
+        source: "stations",
         paint: {
-          "circle-radius": 4,
+          "circle-radius": 3,
           "circle-color": "#ffffff",
           "circle-stroke-color": "#000000",
           "circle-stroke-width": 1,
         },
       });
 
+      // 共通ソース: 列車位置 (Point)
+      map.addSource("trains-source", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] }
+      });
+
+      // 列車マーカー設定
       map.addLayer({
-        id: "yamanote-stations-label",
-        type: "symbol",
-        source: "yamanote-stations",
-        layout: {
-          "text-field": ["get", "name_ja"],
-          "text-size": 10,
-          "text-anchor": "top",
-          "text-offset": [0, 0.6],
-        },
+        id: "trains-layer",
+        type: "circle",
+        source: "trains-source",
         paint: {
-          "text-color": "#000000",
-          "text-halo-color": "#ffffff",
-          "text-halo-width": 1,
+          "circle-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            10, 4,
+            14, 8,
+          ],
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#ffffff",
+          "circle-color": [
+            "case",
+            ["==", ["get", "trainNumber"], trackedTrain || ""], "#FF0000", // 追跡中
+            ["==", ["get", "dataQuality"], "rejected"], "#9C27B0", // 無効データ
+            // 遅延による色分け
+            ["step", ["get", "delaySeconds"],
+              "#00B140", 60, // 定刻
+              "#FFA500", 300, // 1分遅延
+              "#FF4500" // 5分以上遅延
+            ]
+          ],
         },
       });
 
-      // 列車マーカー用ソース & レイヤー追加
-      if (!map.getSource("yamanote-trains")) {
-        map.addSource("yamanote-trains", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection",
-            features: [],
-          },
-        });
+      // ポップアップ設定
+      const popup = new mapboxgl.Popup({ closeButton: false, closeOnClick: false });
 
-        map.addLayer({
-          id: "yamanote-trains-circle",
-          type: "circle",
-          source: "yamanote-trains",
-          paint: {
-            "circle-radius": [
-              "interpolate",
-              ["linear"],
-              ["zoom"],
-              10, ["case", ["==", ["get", "trainNumber"], trackedTrain || ""], 8, 4],
-              14, ["case", ["==", ["get", "trainNumber"], trackedTrain || ""], 12, 8],
-            ],
-            "circle-stroke-width": 2,
-            "circle-stroke-color": "#ffffff",
-            "circle-color": [
-              "case",
-              // 追跡中は赤
-              ["==", ["get", "trainNumber"], trackedTrain || ""],
-              "#FF0000",
-              // dataQuality: rejected (無効) = 紫
-              ["==", ["get", "dataQuality"], "rejected"],
-              "#9C27B0",
-              // MS6: 遅延による色分け（step式）
-              ["step",
-                ["get", "delaySeconds"],
-                "#00B140", // 0~59秒: 緑（定刻）
-                60, "#FFA500", // 60~299秒: オレンジ（1~5分遅れ）
-                300, "#FF4500" // 300秒~: 赤（5分以上遅れ）
-              ]
-            ],
-            "circle-opacity": 0.9,
-          },
-        });
-      }
+      map.on('mouseenter', 'trains-layer', (e) => {
+        map.getCanvas().style.cursor = 'pointer';
+        const coordinates = e.features[0].geometry.coordinates.slice();
+        const props = e.features[0].properties;
 
-      // ★ 比較表示用: 時刻表位置マーカー（Ghost - 半透明）
-      if (!map.getSource("yamanote-trains-timetable")) {
-        map.addSource("yamanote-trains-timetable", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection",
-            features: [],
-          },
-        });
+        const html = `
+          <div style="font-size:12px; color:black;">
+            <strong>${props.trainNumber}</strong><br/>
+            ${props.isStopped ? '停車中' : '走行中'}<br/>
+            遅延: ${Math.floor(props.delaySeconds / 60)}分
+          </div>
+        `;
+        popup.setLngLat(coordinates).setHTML(html).addTo(map);
+      });
 
-        map.addLayer({
-          id: "yamanote-trains-timetable-circle",
-          type: "circle",
-          source: "yamanote-trains-timetable",
-          paint: {
-            "circle-radius": [
-              "interpolate",
-              ["linear"],
-              ["zoom"],
-              10, 3,
-              14, 6,
-            ],
-            "circle-stroke-width": 1,
-            "circle-stroke-color": "#888888",
-            "circle-color": "#CCCCCC",
-            "circle-opacity": 0.4,
-          },
-        });
-      }
+      map.on('mouseleave', 'trains-layer', () => {
+        map.getCanvas().style.cursor = '';
+        popup.remove();
+      });
 
-      // ★ 比較表示用: GTFS-RT実測位置マーカー（強調表示）
-      if (!map.getSource("yamanote-trains-gtfs")) {
-        map.addSource("yamanote-trains-gtfs", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection",
-            features: [],
-          },
-        });
-
-        map.addLayer({
-          id: "yamanote-trains-gtfs-circle",
-          type: "circle",
-          source: "yamanote-trains-gtfs",
-          paint: {
-            "circle-radius": [
-              "interpolate",
-              ["linear"],
-              ["zoom"],
-              10, 4,
-              14, 7,
-            ],
-            "circle-stroke-width": 3,
-            "circle-stroke-color": "#FF5722",  // オレンジ系の強調色
-            "circle-color": "#FFFFFF",
-            "circle-opacity": 0.9,
-          },
-        });
-      }
-
-      // MS2: API の動作確認
-      const apiData = await fetchLinesFromApi();
-      console.log("API /api/lines result:", apiData);
+      // 初期ロード完了後にデータ取得を開始
+      initLineData(selectedLine);
     });
 
-    return () => { };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
 
+  // ========== 路線切り替え時の処理 ==========
+  useEffect(() => {
+    if (!mapRef.current || !mapRef.current.loaded()) return;
+    initLineData(selectedLine);
+  }, [selectedLine]);
 
-  // stop_sequence → 駅インデックス
-  function stopSeqToStationIndex(stopSeq, direction) {
-    if (direction === 'OuterLoop') {
-      return (stopSeq - 1) % 30;
-    } else {
-      return (32 - stopSeq - 1) % 30;
+
+  // 路線データ(形状・駅)の読み込みとポーリング開始
+  const initLineData = async (lineId) => {
+    const map = mapRef.current;
+    const config = AVAILABLE_LINES.find(l => l.id === lineId) || AVAILABLE_LINES[0];
+
+    // 1. 地図上の線の色を変更
+    if (map.getLayer('railway-line-layer')) {
+      map.setPaintProperty('railway-line-layer', 'line-color', config.color);
     }
-  }
 
-  // 次の駅インデックス
-  function getNextStationIndex(currentIndex, direction) {
-    if (direction === 'OuterLoop') {
-      return (currentIndex + 1) % 30;
-    } else {
-      return (currentIndex - 1 + 30) % 30;
+    // 2. 静的データ(線路形状・駅)を取得して更新
+    try {
+      const railways = await fetchRailways();
+      const stations = await fetchStations();
+      const coordsData = await fetchCoordinates();
+
+      if (railways && stations && coordsData) {
+        updateStaticMap(map, config, railways, stations, coordsData);
+      }
+    } catch (e) {
+      console.error("Static data load error:", e);
     }
-  }
 
-  // 2点間の線形補間
-  function interpolatePosition(from, to, progress) {
-    return {
-      lat: from.lat + (to.lat - from.lat) * progress,
-      lon: from.lon + (to.lon - from.lon) * progress,
-    };
-  }
+    // アニメーション用バッファをクリア（列車が飛び跳ねるのを防ぐ）
+    trainPositionsRef.current = {};
 
-  // ポーリング用 useEffect
+    // 既存の列車マーカーを一旦消す
+    const trainsSrc = map.getSource("trains-source");
+    if (trainsSrc) {
+      trainsSrc.setData({ type: "FeatureCollection", features: [] });
+    }
+  };
+
+  // 地図の静的要素(線・駅)を更新する関数
+  const updateStaticMap = (map, config, railways, stations, coordsData) => {
+    const targetRailwayId = config.railwayId;
+
+    // 線路形状 (MultiLineString + クリーニング)
+    const railwayCoordsEntry = coordsData.railways?.find(c => c.id === targetRailwayId);
+    let multiLineCoords = [];
+
+    if (railwayCoordsEntry && Array.isArray(railwayCoordsEntry.sublines)) {
+      railwayCoordsEntry.sublines.forEach(sub => {
+        if (Array.isArray(sub.coords) && sub.coords.length > 0) {
+          // ★ここでサニタイズ処理: 長すぎる直線を分割
+          const cleanedSegments = cleanLineSegments(sub.coords);
+          multiLineCoords.push(...cleanedSegments);
+        }
+      });
+    }
+
+    // 駅 (Points)
+    const targetLineInfo = railways.find(r => r.id === targetRailwayId);
+    const stationIds = targetLineInfo?.stations || [];
+    const targetStations = stations.filter(st => stationIds.includes(st.id));
+
+    // Mapboxソース更新
+    const lineSource = map.getSource('railway-line');
+    if (lineSource) {
+      lineSource.setData({
+        type: "Feature",
+        geometry: { type: "MultiLineString", coordinates: multiLineCoords },
+        properties: {}
+      });
+    }
+
+    const stationSource = map.getSource('stations');
+    if (stationSource) {
+      stationSource.setData({
+        type: "FeatureCollection",
+        features: targetStations.map(st => ({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: st.coord },
+          properties: { name: st.title.ja }
+        }))
+      });
+    }
+  };
+
+
+  // ========== データポーリング (定期実行) ==========
   useEffect(() => {
     let intervalId = null;
 
     const fetchAndUpdate = async () => {
       const map = mapRef.current;
-      if (!map) return;
+      if (!map || !map.getSource("trains-source")) return;
 
-      const src = map.getSource("yamanote-trains");
-      if (!src) return;
+      const currentLineId = selectedLineRef.current; // Refから最新の値を取得
 
       try {
-        // ★ MS4: v4 API（TripUpdate-only）を使用
-        const res = await fetch("/api/trains/yamanote/positions/v4");
+        // ★ API呼び出し: 選択中の路線IDを使う
+        const res = await fetch(`/api/trains/${currentLineId}/positions/v4`);
         if (!res.ok) return;
         const json = await res.json();
+        const positions = json.positions || [];
 
-        // v4 では positions 配列を使用
-        const v4Positions = json.positions || [];
+        // GeoJSON変換 & アニメーション目標更新
+        const now = performance.now();
 
-        // ★ MS4: v4レスポンスを既存のフラット構造にマッピング
-        // 既存UIとの互換性を維持するため、既存プロパティ名に変換
-        const gtfsTrains = v4Positions
-          .filter(p => p.location && p.location.latitude != null && p.location.longitude != null)
-          .map(p => {
-            // dataQuality の擬似生成（既存の色分け互換）
-            let dataQuality = 'good';
-            if (p.status === 'unknown') {
-              dataQuality = 'stale';
-            } else if (p.status === 'invalid') {
-              dataQuality = 'rejected';
-            }
-
-            return {
-              // 既存プロパティ（フラット）
-              trainNumber: p.train_number || '',
-              tripId: p.trip_id,
-              direction: p.direction,
-              latitude: p.location.latitude,
-              longitude: p.location.longitude,
-              stopSequence: p.segment?.prev_seq || null,
-              departureTime: p.times?.t0_departure || null,
-              nextArrivalTime: p.times?.t1_arrival || null,
-              isStopped: p.status === 'stopped',
-              progress: p.progress,
-              dataQuality: dataQuality,
-              source: 'v4-tripupdate',
-              // 追加情報
-              status: p.status,
-              fromStation: p.segment?.prev_station_id || null,
-              toStation: p.segment?.next_station_id || null,
-              stationId: p.status === 'stopped' ? p.segment?.prev_station_id : null,
-              // MS6: 遅延情報
-              delay: p.delay || 0,
-              // 比較座標（v4では同じ座標を使う）
-              timetableLatitude: null,
-              timetableLongitude: null,
-              gtfsLatitude: null,
-              gtfsLongitude: null,
-            };
-          });
-
-        // ★ デバッグ: v4 APIレスポンスの生データ確認
-        if (gtfsTrains.length > 0) {
-          const sample = gtfsTrains[0];
-          console.log('[debug] v4 API response sample:', {
-            trainNumber: sample.trainNumber,
-            direction: sample.direction,
-            stopSequence: sample.stopSequence,
-            latitude: sample.latitude,
-            longitude: sample.longitude,
-            departureTime: sample.departureTime,
-            nextArrivalTime: sample.nextArrivalTime,
-            dataQuality: sample.dataQuality,
-            source: sample.source,
-          });
-        }
-
-        const now = Math.floor(Date.now() / 1000);  // 現在時刻（UNIXタイムスタンプ）
-        // ★ デバッグ: 現在時刻とdepartureTimeの比較
-        console.log('[debug] now:', now, 'date:', new Date(now * 1000).toLocaleTimeString('ja-JP'));
-
-        // ========== stopSequence変化検知（GTFS-RT遅延計測用） ==========
-        for (const train of gtfsTrains) {
-          const prevState = trainStatesRef.current[train.trainNumber];
-
-          if (prevState && prevState.stopSeq !== train.stopSequence) {
-            // stopSequenceが変わった！= 新しい駅に到着した
-            const prevStationIdx = stopSeqToStationIndex(prevState.stopSeq, train.direction);
-            const newStationIdx = stopSeqToStationIndex(train.stopSequence, train.direction);
-            const prevStation = YAMANOTE_STATIONS[prevStationIdx]?.id || '?';
-            const newStation = YAMANOTE_STATIONS[newStationIdx]?.id || '?';
-
-            const detectTime = new Date(now * 1000).toLocaleTimeString('ja-JP');
-            const departureTimeStr = train.departureTime
-              ? new Date(train.departureTime * 1000).toLocaleTimeString('ja-JP')
-              : 'N/A';
-
-            // 遅延 = 検知時刻 - 出発時刻（マイナスなら出発前に検知）
-            const delay = train.departureTime ? (now - train.departureTime) : null;
-
-            console.log(`%c[GTFS-RT更新検知] ${train.trainNumber}`, 'background: purple; color: white; font-size: 14px;');
-            console.log({
-              列車: train.trainNumber,
-              方向: train.direction,
-              区間変化: `${prevStation} → ${newStation}`,
-              stopSeq変化: `${prevState.stopSeq} → ${train.stopSequence}`,
-              検知時刻: detectTime,
-              新駅出発予定: departureTimeStr,
-              遅延秒数: delay !== null ? `${delay}秒` : 'N/A',
-              備考: delay !== null && delay > 0 ? '⚠️ 出発時刻を過ぎてから検知' : '✓ 出発前に検知',
-            });
-            console.log('---');
-          }
-
-          // 状態を更新
-          trainStatesRef.current[train.trainNumber] = {
-            stopSeq: train.stopSequence,
-            lastUpdate: now,
-          };
-        }
-
-        // v4 API は既にブレンド済みの座標を返すのでそのまま使用
-        const positions = gtfsTrains.map(train => {
-          // 追跡中の列車を詳細ログ
-          if (trackedTrainRef.current && train.trainNumber === trackedTrainRef.current) {
-            console.log(`[TRACKED ${trackedTrainRef.current}] ===========================`);
-            console.log({
-              fromBackend: {
-                latitude: train.latitude,
-                longitude: train.longitude,
-                fromStation: train.fromStation,
-                toStation: train.toStation,
-                progress: train.progress,
-                direction: train.direction,
-                isStopped: train.isStopped,
-                stationId: train.stationId,
-                dataQuality: train.dataQuality,
-              },
-              time: {
-                now,
-                timestamp: json.timestamp,
-              }
-            });
-            console.log(`[TRACKED ${trackedTrainRef.current}] ===========================`);
-          }
-
-          return {
-            lat: train.latitude,
-            lon: train.longitude,
-            direction: train.direction,
-            trainNumber: train.trainNumber,
-            fromStation: train.fromStation,
-            toStation: train.toStation,
-            progress: train.progress,
-            isStopped: train.isStopped,
-            stationId: train.stationId,
-            dataQuality: train.dataQuality,
-            // GTFS-RT情報
-            stopSequence: train.stopSequence,
-            gtfsStatus: train.status,
-            // 時刻情報（v4 API）
-            departureTimeRaw: train.departureTime,
-            arrivalTimeRaw: train.nextArrivalTime,
-            // MS6: 遅延情報
-            delaySeconds: train.delay || 0,
-            // 比較座標（v4ではない）
-            timetableLat: train.timetableLatitude,
-            timetableLon: train.timetableLongitude,
-            gtfsLat: train.gtfsLatitude,
-            gtfsLon: train.gtfsLongitude,
-          };
-        });
-
-        // GeoJSON に変換（検索フィルタ適用）
-        const query = searchQueryRef.current.trim().toLowerCase();
+        // 検索フィルタ
+        const query = searchQueryRef.current.trim().toUpperCase();
         const filteredPositions = query
-          ? positions.filter(p => p.trainNumber.toLowerCase().includes(query))
+          ? positions.filter(p => p.train_number && p.train_number.includes(query))
           : positions;
 
-        // 表示モードに応じてブレンドマーカーを表示/非表示
-        const mode = displayModeRef.current;
-        const showBlend = mode === 'all' || mode === 'blend';
-        const showTimetable = mode === 'all' || mode === 'timetable';
-        const showGtfs = mode === 'all' || mode === 'gtfs';
+        const activeKeys = new Set();
 
-        const features = showBlend ? filteredPositions.map(p => ({
-          type: "Feature",
-          geometry: {
-            type: "Point",
-            coordinates: [p.lon, p.lat],
-          },
-          properties: { ...p },
-        })) : [];
-
-        // MS9: 目標位置を更新（アニメーション用）
-        const animNow = performance.now();
         filteredPositions.forEach(p => {
-          const key = p.trainNumber;
-          const newTarget = [p.lon, p.lat];
+          if (!p.location) return;
+          const key = p.train_number;
+          activeKeys.add(key);
+
+          const newTarget = [p.location.longitude, p.location.latitude];
+
+          // データ補正 (プロパティを扱いやすい形に)
+          const props = {
+            trainNumber: p.train_number,
+            delaySeconds: p.delay || 0,
+            isStopped: p.status === 'stopped',
+            dataQuality: 'good'
+          };
 
           if (!trainPositionsRef.current[key]) {
+            // 新規列車
             trainPositionsRef.current[key] = {
-              current: newTarget.slice(),
-              target: newTarget.slice(),
-              startTime: animNow,
-              properties: { ...p },
+              current: newTarget,
+              target: newTarget,
+              startTime: now,
+              properties: props
             };
           } else {
+            // 更新
             const old = trainPositionsRef.current[key];
             trainPositionsRef.current[key] = {
-              current: old.target.slice(),
-              target: newTarget.slice(),
-              startTime: animNow,
-              properties: { ...p },
+              current: old.target, // 前回ターゲットを現在地とする
+              target: newTarget,
+              startTime: now,
+              properties: props
             };
           }
         });
 
-        const activeTrains = new Set(filteredPositions.map(p => p.trainNumber));
+        // 消失した列車を削除
         Object.keys(trainPositionsRef.current).forEach(key => {
-          if (!activeTrains.has(key)) delete trainPositionsRef.current[key];
-        });
-        lastFetchTimeRef.current = animNow;
-
-        src.setData({
-          type: "FeatureCollection",
-          features,
+          if (!activeKeys.has(key)) delete trainPositionsRef.current[key];
         });
 
-        // ★ 比較表示用マーカーのデータを設定（検索フィルタ + 表示モード適用）
-        const filteredGtfsTrains = query
-          ? gtfsTrains.filter(t => t.trainNumber.toLowerCase().includes(query))
-          : gtfsTrains;
-
-        // 時刻表位置（Ghost）
-        const timetableSrc = map.getSource("yamanote-trains-timetable");
-        if (timetableSrc) {
-          const timetableFeatures = showTimetable ? filteredGtfsTrains
-            .filter(t => t.timetableLatitude && t.timetableLongitude)
-            .map(t => ({
-              type: "Feature",
-              geometry: {
-                type: "Point",
-                coordinates: [t.timetableLongitude, t.timetableLatitude],
-              },
-              properties: {
-                trainNumber: t.trainNumber,
-                direction: t.direction,
-                type: "timetable",
-              },
-            })) : [];
-          timetableSrc.setData({
-            type: "FeatureCollection",
-            features: timetableFeatures,
-          });
-        }
-
-        // GTFS-RT実測位置（強調）
-        const gtfsSrc = map.getSource("yamanote-trains-gtfs");
-        if (gtfsSrc) {
-          const gtfsFeatures = showGtfs ? filteredGtfsTrains
-            .filter(t => t.gtfsLatitude && t.gtfsLongitude)
-            .map(t => ({
-              type: "Feature",
-              geometry: {
-                type: "Point",
-                coordinates: [t.gtfsLongitude, t.gtfsLatitude],
-              },
-              properties: {
-                trainNumber: t.trainNumber,
-                direction: t.direction,
-                type: "gtfs",
-              },
-            })) : [];
-          gtfsSrc.setData({
-            type: "FeatureCollection",
-            features: gtfsFeatures,
-          });
-        }
-
-        // dataQuality 別の集計
-        const qualityCounts = {};
-        positions.forEach(p => {
-          qualityCounts[p.dataQuality] = (qualityCounts[p.dataQuality] || 0) + 1;
-        });
-        console.log(`[v3 hybrid] trains: ${positions.length}`, qualityCounts);
-
-        // 消失検知
-        if (trackedTrain) {
-          const found = positions.find(p => p.trainNumber === trackedTrain);
-          if (!found) {
-            console.error(`[TRACKED ${trackedTrain}] ⚠️⚠️⚠️ 消失！APIレスポンスに存在しない`);
-          }
-        }
       } catch (err) {
-        console.error("[hybrid] error:", err);
+        console.error("Polling error:", err);
       }
     };
 
-    const startPolling = () => {
-      fetchAndUpdate();
-      intervalId = setInterval(fetchAndUpdate, TRAIN_UPDATE_INTERVAL_MS);
-    };
+    // 初回実行と定期実行
+    fetchAndUpdate();
+    intervalId = setInterval(fetchAndUpdate, TRAIN_UPDATE_INTERVAL_MS);
 
-    const map = mapRef.current;
-    if (map) {
-      if (map.loaded()) {
-        startPolling();
-      } else {
-        map.on("load", startPolling);
-      }
-    }
+    return () => clearInterval(intervalId);
+  }, []); // 依存配列は空 (内部でRefを使って最新の路線IDを見るため)
 
-    return () => {
-      if (intervalId) clearInterval(intervalId);
-      if (map) map.off("load", startPolling);
-    };
-  }, []);
 
   return (
     <div style={{ position: 'relative', width: "100vw", height: "100vh" }}>
-      {/* 列車追跡UI */}
+      {/* コントロールパネル */}
       <div style={{
         position: 'absolute',
         top: 10,
         left: 10,
         zIndex: 1000,
-        background: 'white',
-        padding: '10px',
-        borderRadius: '5px',
-        boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
+        background: 'rgba(255, 255, 255, 0.95)',
+        padding: '15px',
+        borderRadius: '8px',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '10px',
+        width: '250px'
       }}>
-        {/* 検索フィルタ */}
-        <div style={{ marginBottom: '8px' }}>
-          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>🔍 検索:</span>
-          <input
-            type="text"
-            placeholder="列車番号で絞り込み"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value.toUpperCase())}
-            style={{
-              width: '140px',
-              marginRight: '10px',
-              padding: '4px 8px',
-              border: '1px solid #ccc',
-              borderRadius: '4px',
-            }}
-          />
-          {searchQuery && (
-            <button
-              onClick={() => setSearchQuery("")}
-              style={{
-                padding: '4px 8px',
-                cursor: 'pointer',
-                border: '1px solid #ccc',
-                borderRadius: '4px',
-                backgroundColor: '#f5f5f5',
-              }}
-            >
-              クリア
-            </button>
-          )}
-          {searchQuery && (
-            <span style={{ marginLeft: '10px', fontSize: '12px', color: '#666' }}>
-              フィルタ中: "{searchQuery}"
-            </span>
-          )}
-        </div>
-        {/* 追跡機能 */}
-        <div style={{ marginBottom: '8px' }}>
-          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>📍 追跡:</span>
-          <input
-            type="text"
-            placeholder="列車番号 (例: 005G)"
-            onChange={(e) => setTrackedTrain(e.target.value.toUpperCase() || null)}
-            style={{ width: '120px', marginRight: '5px' }}
-          />
-          <span style={{ fontSize: '12px', color: '#666' }}>
-            {trackedTrain ? `追跡中: ${trackedTrain}` : '未選択'}
-          </span>
-        </div>
-        {/* 表示モード切り替え */}
+        <h2 style={{ margin: 0, fontSize: '16px', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>
+          NowTrain コントロール
+        </h2>
+
+        {/* 1. 路線選択 (MS11の核心) */}
         <div>
-          <span style={{ marginRight: '5px', fontWeight: 'bold' }}>👁 表示:</span>
-          {[
-            { mode: 'all', label: '全て' },
-            { mode: 'blend', label: 'ブレンド' },
-            { mode: 'timetable', label: '時刻表のみ' },
-            { mode: 'gtfs', label: 'GTFS-RTのみ' },
-          ].map(({ mode, label }) => (
-            <button
-              key={mode}
-              onClick={() => setDisplayMode(mode)}
-              style={{
-                padding: '4px 8px',
-                marginRight: '5px',
-                cursor: 'pointer',
-                border: displayMode === mode ? '2px solid #2196F3' : '1px solid #ccc',
-                borderRadius: '4px',
-                backgroundColor: displayMode === mode ? '#E3F2FD' : '#f5f5f5',
-                fontWeight: displayMode === mode ? 'bold' : 'normal',
-              }}
-            >
-              {label}
-            </button>
-          ))}
+          <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>
+            🛤 路線選択:
+          </label>
+          <select
+            value={selectedLine}
+            onChange={(e) => setSelectedLine(e.target.value)}
+            style={{ width: '100%', padding: '6px', fontSize: '14px', borderRadius: '4px' }}
+          >
+            {AVAILABLE_LINES.map(line => (
+              <option key={line.id} value={line.id}>
+                {line.name}
+              </option>
+            ))}
+          </select>
         </div>
+
+        {/* 2. 列車検索 */}
+        <div>
+          <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>
+            🔍 列車番号検索:
+          </label>
+          <div style={{ display: 'flex', gap: '5px' }}>
+            <input
+              type="text"
+              placeholder="例: 1234G"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value.toUpperCase())}
+              style={{ flex: 1, padding: '4px', borderRadius: '4px', border: '1px solid #ccc' }}
+            />
+            {searchQuery && (
+              <button onClick={() => setSearchQuery("")} style={{ cursor: 'pointer' }}>×</button>
+            )}
+          </div>
+        </div>
+
+        {/* 3. 追跡 */}
+        <div>
+          <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>
+            📍 自動追跡:
+          </label>
+          <input
+            type="text"
+            placeholder="追跡する列車番号"
+            onChange={(e) => setTrackedTrain(e.target.value.toUpperCase() || null)}
+            style={{ width: '100%', padding: '4px', borderRadius: '4px', border: '1px solid #ccc' }}
+          />
+        </div>
+
       </div>
+
       <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
     </div>
   );

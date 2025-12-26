@@ -49,3 +49,10 @@ lerna-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+*
+!.gitignore
+!data/
+!data/**
+otp_data
+otp_data/

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from constants import (
     TRIP_UPDATE_URL,
-    YAMANOTE_ROUTE_ID,
+    YAMANOTE_ROUTE_ID,  # デフォルト値用に維持
     HTTP_TIMEOUT,
 )
 from gtfs_rt_vehicle import is_yamanote, get_direction, get_train_number
@@ -66,6 +66,7 @@ async def fetch_trip_updates(
     client: httpx.AsyncClient,
     api_key: str,
     data_cache: "DataCache",
+    target_route_id: str = YAMANOTE_ROUTE_ID,  # MS10: デフォルトで後方互換性維持
 ) -> Dict[str, TrainSchedule]:
     """
     GTFS-RT TripUpdate を取得し、列車ごとのリアルタイム駅時刻テーブルに正規化する。
@@ -124,18 +125,19 @@ async def fetch_trip_updates(
         if len(route_id_samples) < 5 and trip.route_id:
             route_id_samples.append(trip.route_id)
         
-        # 4. 山手線フィルタ
-        is_yamanote_train = False
+        # 4. MS10: 路線フィルタ（target_route_id で動的判定）
+        is_target_train = False
         
-        # route_id が取得でき、かつ YAMANOTE_ROUTE_ID と一致する場合
+        # route_id が取得でき、かつ target_route_id と一致する場合
         if trip.route_id:
-            is_yamanote_train = (trip.route_id == YAMANOTE_ROUTE_ID)
+            is_target_train = (trip.route_id == target_route_id)
         
         # route_id が空/未設定/一致しない場合は trip_id でフォールバック判定
-        if not is_yamanote_train:
-            is_yamanote_train = is_yamanote(trip_id)
+        # ※山手線の場合のみ is_yamanote() を使用
+        if not is_target_train and target_route_id == YAMANOTE_ROUTE_ID:
+            is_target_train = is_yamanote(trip_id)
         
-        if not is_yamanote_train:
+        if not is_target_train:
             continue
         
         # 5. キャンセル除外
@@ -245,7 +247,7 @@ async def fetch_trip_updates(
         logger.debug(f"TripUpdate route_id samples: {route_id_samples}")
     
     logger.info(
-        f"Parsed {len(results)} Yamanote TripUpdates "
+        f"Parsed {len(results)} TripUpdates for {target_route_id} "
         f"(feed had {len(feed.entity)} entities)"
     )
     
