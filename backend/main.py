@@ -15,6 +15,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from data_cache import DataCache
+from config import get_line_config  # MS10: 路線設定のインポート
 from train_position import (
     get_yamanote_train_positions,
     get_blended_train_positions,
@@ -677,6 +678,143 @@ async def get_yamanote_positions_v4():
         logger.error(f"Error in v4 endpoint: {e}")
         return {
             "source": "tripupdate_v4",
+            "status": "error",
+            "error": str(e),
+            "timestamp": int(datetime.now(JST).timestamp()),
+            "total_trains": 0,
+            "positions": [],
+        }
+
+
+# ============================================================================
+# MS10: Multi-Line Generic v4 API
+# ============================================================================
+
+@app.get("/api/trains/{line_id}/positions/v4")
+async def get_train_positions_v4(line_id: str):
+    """
+    MS10: 汎用路線の列車位置 v4 API。
+    
+    URLパスパラメータから路線を動的に切り替えて列車位置を取得する。
+    
+    Args:
+        line_id: 路線識別子 ("yamanote", "chuo_rapid", "keihin_tohoku", "sobu_local")
+    """
+    from gtfs_rt_tripupdate import fetch_trip_updates
+    from train_position_v4 import compute_all_progress, calculate_coordinates
+    
+    # 1. 路線設定のロード
+    line_config = get_line_config(line_id)
+    if not line_config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Line '{line_id}' is not supported. "
+                   f"Available lines: yamanote, chuo_rapid, keihin_tohoku, sobu_local"
+        )
+    
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "source": "tripupdate_v4",
+            "line_id": line_id,
+            "line_name": line_config.name,
+            "status": "error",
+            "error": "ODPT_API_KEY not set",
+            "timestamp": int(datetime.now(JST).timestamp()),
+            "total_trains": 0,
+            "positions": [],
+        }
+    
+    try:
+        # 2. MS10: target_route_id を指定して TripUpdate 取得
+        client = app.state.http_client
+        schedules = await fetch_trip_updates(
+            client,
+            api_key,
+            data_cache,
+            target_route_id=line_config.gtfs_route_id  # MS10: 動的に路線を指定
+        )
+        
+        if not schedules:
+            return {
+                "source": "tripupdate_v4",
+                "line_id": line_id,
+                "line_name": line_config.name,
+                "status": "no_data",
+                "timestamp": int(datetime.now(JST).timestamp()),
+                "total_trains": 0,
+                "positions": [],
+            }
+        
+        # 3. MS2: 進捗計算
+        results = compute_all_progress(schedules)
+        
+        # 4. レスポンス構築
+        positions = []
+        now_ts = None
+        
+        for r in results:
+            if r.status == "invalid":
+                continue
+            
+            # MS5: 座標計算（線路形状追従）
+            coord = calculate_coordinates(r, data_cache)
+            lat = coord[0] if coord else None
+            lon = coord[1] if coord else None
+            
+            if now_ts is None:
+                now_ts = r.now_ts
+            
+            positions.append({
+                "trip_id": r.trip_id,
+                "train_number": r.train_number,
+                "direction": r.direction,
+                "status": r.status,
+                "progress": round(r.progress, 4) if r.progress is not None else None,
+                "delay": r.delay,
+                
+                "location": {
+                    "latitude": round(lat, 6) if lat is not None else None,
+                    "longitude": round(lon, 6) if lon is not None else None,
+                },
+                
+                "segment": {
+                    "prev_seq": r.prev_seq,
+                    "next_seq": r.next_seq,
+                    "prev_station_id": r.prev_station_id,
+                    "next_station_id": r.next_station_id,
+                },
+                
+                "times": {
+                    "now_ts": r.now_ts,
+                    "t0_departure": r.t0_departure,
+                    "t1_arrival": r.t1_arrival,
+                },
+                
+                "debug": {
+                    "feed_timestamp": r.feed_timestamp,
+                },
+            })
+        
+        # ソート: direction -> train_number
+        positions.sort(key=lambda p: (p["direction"] or "", p["train_number"] or ""))
+        
+        return {
+            "source": "tripupdate_v4",
+            "line_id": line_id,
+            "line_name": line_config.name,
+            "status": "success",
+            "timestamp": now_ts or int(datetime.now(JST).timestamp()),
+            "total_trains": len(positions),
+            "positions": positions,
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in generic v4 endpoint for {line_id}: {e}")
+        return {
+            "source": "tripupdate_v4",
+            "line_id": line_id,
+            "line_name": line_config.name,
             "status": "error",
             "error": str(e),
             "timestamp": int(datetime.now(JST).timestamp()),

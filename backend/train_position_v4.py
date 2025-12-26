@@ -11,6 +11,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from station_ranks import get_station_dwell_time
 
 from gtfs_rt_tripupdate import TrainSchedule, RealtimeStationSchedule
 
@@ -93,12 +94,48 @@ class SegmentProgress:
 
 def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     """
-    発車時刻を取得する。無ければ到着時刻で代替。
+    発車時刻を取得する。
+    arrival == departure の場合（GTFS時刻表の仕様）は、
+    ランクごとの停車時間（station_ranks.py）を加算して返す。
     """
-    if schedule.departure_time is not None:
-        return schedule.departure_time
-    return schedule.arrival_time
+    arr = schedule.arrival_time
+    dep = schedule.departure_time
 
+    # 両方ある場合
+    if arr is not None and dep is not None:
+        # 時刻表上で到着=発車となっている場合、停車時間を足して「実質発車時刻」を作る
+        if arr == dep:
+            dwell = get_station_dwell_time(schedule.station_id)
+            return arr + dwell
+        return dep
+        
+    # departureだけある
+    if dep is not None:
+        return dep
+        
+    # arrivalだけある（稀なケース）
+    if arr is not None:
+        dwell = get_station_dwell_time(schedule.station_id)
+        return arr + dwell
+
+    return None
+
+def _is_stopped_at_station(
+    schedule: RealtimeStationSchedule,
+    now_ts: int,
+) -> bool:
+    """
+    現在時刻がこの駅の到着〜発車の間にあるか判定。
+    """
+    arr = schedule.arrival_time
+    
+    # 統一ロジックを使って発車時刻を取得
+    effective_dep = _get_departure_time(schedule)
+    
+    if arr is not None and effective_dep is not None:
+        return arr <= now_ts <= effective_dep
+    
+    return False
 
 def _get_arrival_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     """

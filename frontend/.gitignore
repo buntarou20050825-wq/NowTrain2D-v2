@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+*
+!.gitignore
+!data/
+!data/**
+otp_data
+otp_data/
